@@ -1,0 +1,149 @@
+name: douyin-downloader
+description: |
+  下载抖音视频和合集。
+  Trigger phrases: "下载抖音视频", "下载抖音合集", "douyin download", 
+  "get douyin video", "download douyin mix"
+version: 1.1.0
+author: opencode
+license: MIT
+
+# 技能入口
+entry:
+  python: core.py
+  function: DouyinDownloadSkill
+
+# 依赖配置
+dependencies:
+  python:
+    - f2>=0.0.1.7
+    - aiosqlite
+    - httpx
+  system:
+    - playwright  # 用于Cookie自动获取
+
+# 配置参数
+parameters:
+  - name: config_path
+    type: str
+    default: "./my_douyin.yaml"
+    description: F2配置文件路径
+  - name: cookie
+    type: str
+    default: null
+    description: 抖音Cookie字符串（可选，自动获取）
+  - name: download_path
+    type: str
+    default: "Download"
+    description: 视频下载保存路径
+  - name: proxies
+    type: dict
+    default: {"http://": null, "https://": null}
+    description: 代理配置
+
+# 主要功能
+functions:
+  download_single_video:
+    description: 下载单个抖音视频
+    parameters:
+      - name: video_url
+        type: str
+        required: true
+        description: 视频链接URL
+    returns:
+      type: dict
+      description: 包含下载状态和视频信息的字典
+
+  download_mix_videos:
+    description: 下载指定合集的所有视频
+    parameters:
+      - name: user_home_url
+        type: str
+        required: true
+        description: 用户主页链接
+      - name: mix_id
+        type: str
+        required: true
+        description: 合集ID
+    returns:
+      type: dict
+      description: 下载结果状态
+
+  get_mix_info_by_video_url:
+    description: 根据视频URL获取所属合集信息
+    parameters:
+      - name: video_url
+        type: str
+        required: true
+        description: 视频链接
+    returns:
+      type: dict
+      description: 包含mix_id, mix_name, mix_desc的字典
+
+  download_mix_by_id:
+    description: 根据合集ID直接下载（无需用户主页）
+    parameters:
+      - name: mix_id
+        type: str
+        required: true
+        description: 合集ID
+      - name: mix_name
+        type: str
+        default: ""
+        description: 合集名称（用于目录命名）
+    returns:
+      type: dict
+      description: 下载结果状态
+
+  download_mixes_by_ids:
+    description: 批量下载多个合集
+    parameters:
+      - name: mix_ids_input
+        type: str
+        required: true
+        description: 合集ID列表字符串，支持空格、逗号、换行、分号等分隔符
+      - name: mix_name
+        type: str
+        default: ""
+        description: 合集名称（用于目录命名前缀）
+    returns:
+      type: dict
+      description: 包含每个合集下载结果的字典
+
+  download_user_posts:
+    description: 下载用户主页作品
+    parameters:
+      - name: user_url
+        type: str
+        required: true
+        description: 用户主页链接
+    returns:
+      type: dict
+      description: 下载结果状态
+
+  refresh_cookie:
+    description: 强制刷新抖音Cookie
+    parameters:
+      - name: headless
+        type: bool
+        default: true
+        description: 是否使用无头浏览器
+    returns:
+      type: str
+      description: 新的Cookie字符串
+
+# 使用示例
+examples:
+  - description: 下载单个视频
+    code: |
+      skill = DouyinDownloadSkill()
+      result = await skill.download_single_video("https://v.douyin.com/xxx")
+      
+  - description: 下载整个合集
+    code: |
+      skill = DouyinDownloadSkill()
+      await skill.download_mix_by_id("mix_id_here", "合集名称")
+
+# 文档链接
+documentation:
+  f2_api: https://f2.wiki/guide/apps/douyin/overview
+  readme: README.md

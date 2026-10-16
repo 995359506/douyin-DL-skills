@@ -1,0 +1,15 @@
+# Python依赖
+f2>=0.0.1.8
+playwright
+aiosqlite
+httpx
+pytest>=8.0
+pytest-asyncio>=0.23
+
+# Web API依赖
+fastapi
+uvicorn[standard]
+pydantic
+
+# 异步文件操作
+aiofiles

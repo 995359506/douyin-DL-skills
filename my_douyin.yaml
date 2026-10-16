@@ -1,0 +1,9 @@
+douyin:
+  path: Download
+  max_connections: 5
+  timeout: 10
+  max_retries: 3
+  max_tasks: 5
+  page_counts: 20
+  naming: '{aweme_id}_{desc:.40}'
+  interval: all

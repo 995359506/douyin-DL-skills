@@ -1,0 +1,118 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Database files (contains sensitive data)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+douyin_videos.db
+douyin_downloader.db
+douyin_users.db
+
+# Cookie files (sensitive)
+douyin_cookie.txt
+*_cookie.txt
+
+# Downloaded content (large files)
+Download/
+downloads/
+*.mp4
+*.mov
+*.mkv
+*.avi
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.cache/
+
+# Cache
+.cache/
+.ruff_cache/
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+nul
+
+# Compressed archives
+*.zip
+*.tar.gz
+*.tar
+*.rar
+
+# F2 framework source (should be installed via pip)
+f2-0.0.1.8-pw3/
+f2-0.0.1.8-pw3.zip
+
+# Project specific
+download_tasks.json
+TODO.md
+
+# AI Agent configuration (local only)
+.agent/
+.agents/
+.claude/
+.opencode/
+.reasonix/
+.learnings/
+AI_FIX_PROMPTS.md
+
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# Test screenshots
+test_screenshots/
+
+# Legacy scripts (moved to skills/douyin_downloader/)
+dy_scripts/
