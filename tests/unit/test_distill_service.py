@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import zipfile
 from pathlib import Path
 
@@ -160,6 +161,29 @@ def test_synthesis_expression_validation_and_audit():
     result = DistillSynthesis._validate(data, items)
     assert len(result["expressions"]) == 2
     assert result["_audit"]["expressions"] == {"returned": 6, "kept": 2, "discarded": {"missing_quote": 1, "sources_mismatch": 1, "not_in_source": 2}}
+
+
+@pytest.mark.asyncio
+async def test_synthesis_excludes_original_comment_ideas_without_mutating_summary(monkeypatch):
+    summary = {**_valid_summary(), "comment_ideas": [{"style": "搞笑有梗", "text": "原创评论不应成为归纳事实"}]}
+    item = {"ordinal": 1, "item_status": "ready", "metadata": {"title": "作品"}, "summary": summary, "polished_text": "原片口播"}
+    original = copy.deepcopy(summary)
+    prompts = []
+    synthesis = DistillSynthesis(base_url="https://example.test/v1", api_key="test")
+
+    async def chat(prompt):
+        prompts.append(prompt)
+        return '{"themes":[],"methods":[],"contradictions":[],"expressions":[]}'
+
+    monkeypatch.setattr(synthesis, "_chat", chat)
+    await synthesis.run([item])
+    assert len(prompts) == 1
+    assert "comment_ideas" not in prompts[0]
+    assert "原创评论不应成为归纳事实" not in prompts[0]
+    assert original["overview"] in prompts[0]
+    assert "原片口播" in prompts[0]
+    assert item["summary"] is summary
+    assert item["summary"] == original
 
 
 @pytest.mark.parametrize("value,expected", [

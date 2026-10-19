@@ -64,8 +64,10 @@ try:
     from .db import TaskVideoInfo
     from .scan_manager import ScanAccessError, normalize_scan_item, scan_manager
     from .transcription_service import TranscriptionService, new_job_id, serialize_error
-    from .video_summary_service import VideoSummaryService, new_summary_job_id, serialize_summary_error
+    from .video_summary_service import VideoSummaryService, new_summary_job_id, serialize_summary_error, normalize_comment_ideas
     from .distill_service import DistillService, DistillSynthesis, DistillError, DistillMarkdown, _source_is_current, _summary_invalid_reason
+    from .download_queue import PersistentDownloadQueue
+    from .download_queue_api import create_download_queue_router
 except ImportError:
     from core import (
         DouyinDownloadSkill,
@@ -79,8 +81,10 @@ except ImportError:
     from db import TaskVideoInfo
     from scan_manager import ScanAccessError, normalize_scan_item, scan_manager
     from transcription_service import TranscriptionService, new_job_id, serialize_error
-    from video_summary_service import VideoSummaryService, new_summary_job_id, serialize_summary_error
+    from video_summary_service import VideoSummaryService, new_summary_job_id, serialize_summary_error, normalize_comment_ideas
     from distill_service import DistillService, DistillSynthesis, DistillError, DistillMarkdown, _source_is_current, _summary_invalid_reason
+    from download_queue import PersistentDownloadQueue
+    from download_queue_api import create_download_queue_router
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -180,6 +184,7 @@ running_transcript_batches: Dict[str, asyncio.Task] = {}
 transcription_service = TranscriptionService()
 video_summary_service = VideoSummaryService()
 distill_service: Optional[DistillService] = None
+download_queue: Optional[PersistentDownloadQueue] = None
 
 INTERVAL_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2})\|(\d{4}-\d{2}-\d{2})$")
 MIX_ID_PATTERN = re.compile(r"^\d{5,32}$")
@@ -292,6 +297,7 @@ async def _download_with_auto_retry(
     task_id: str,
     progress_percentage: int,
     label: str,
+    pause_on_rejection: bool = False,
 ) -> Dict[str, Any]:
     """Run one download operation with a bounded, user-visible anti-risk retry policy."""
     attempts = DOWNLOAD_AUTO_RETRY_MAX + 1
@@ -299,6 +305,7 @@ async def _download_with_auto_retry(
         "success": False,
         "message": "下载失败",
     }
+    retries_performed = 0
 
     for attempt in range(attempts):
         try:
@@ -320,25 +327,29 @@ async def _download_with_auto_retry(
 
         if last_result.get("success") or not _is_download_auto_retryable(last_result):
             break
+        if pause_on_rejection and _download_status_code(last_result) in {401, 403, 429}:
+            break
         if attempt >= attempts - 1:
             break
 
         status_code = _download_status_code(last_result) or 403
         retry_number = attempt + 1
-        delay_text = f"{DOWNLOAD_AUTO_RETRY_DELAY:g} 秒"
+        delay = DOWNLOAD_AUTO_RETRY_DELAY * (2 ** attempt if pause_on_rejection else 1)
+        delay_text = f"{delay:g} 秒"
         await _update_task_progress(
             task_id,
             progress_percentage,
             f"{label}：HTTP {status_code}，请求被拒绝或暂不可用，等待 {delay_text} 后自动重试（{retry_number}/{DOWNLOAD_AUTO_RETRY_MAX}）",
         )
-        await asyncio.sleep(DOWNLOAD_AUTO_RETRY_DELAY)
+        retries_performed = retry_number
+        await asyncio.sleep(delay)
 
-    if not last_result.get("success") and _is_download_auto_retryable(last_result):
+    if not last_result.get("success") and _is_download_auto_retryable(last_result) and retries_performed:
         status_code = _download_status_code(last_result) or 403
         last_result = dict(last_result)
         last_result["message"] = (
             f"{last_result.get('message') or f'HTTP {status_code}'}；"
-            f"系统已自动重试 {DOWNLOAD_AUTO_RETRY_MAX} 次仍未成功"
+            f"系统已自动重试 {retries_performed} 次仍未成功"
         )
         last_result["status_code"] = status_code
     return last_result
@@ -369,6 +380,178 @@ def _require_valid_cookie() -> None:
                 "action": "刷新 Cookie 后重试",
             },
         )
+
+
+def _check_download_queue_config(auto_summary: bool) -> None:
+    """入队只检查本地配置，不预取视频详情或下载媒体。"""
+    if skill is None:
+        raise HTTPException(status_code=503, detail="下载服务尚未初始化")
+    _require_valid_cookie()
+    if auto_summary:
+        try:
+            video_summary_service.validate_config()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=422, detail={"code": "SUMMARY_CONFIG_INVALID", "message": "视频总结模型配置不完整", "action": "检查模型服务地址、模型和 API Key 配置后重试"}) from exc
+
+
+async def _prepare_queued_download(aweme_id: str, author: str, profile_id: str, *, local_only: bool = False) -> Optional[str]:
+    """开始处理单条时才创建任务；按作品编号复用已有记录。"""
+    rows = await task_manager.db.fetch_all(
+        "SELECT t.task_id, t.type, v.status FROM tasks t JOIN task_videos v ON v.task_id=t.task_id "
+        "WHERE t.type IN ('single','batch_item','post','mix','mix_user') AND v.aweme_id=? "
+        "ORDER BY CASE WHEN EXISTS (SELECT 1 FROM video_summary_jobs j WHERE j.task_id=t.task_id "
+        "AND j.status='completed' AND NULLIF(j.summary_json,'') IS NOT NULL) THEN 0 "
+        "WHEN EXISTS (SELECT 1 FROM distill_items d WHERE d.task_id=t.task_id "
+        "AND NULLIF(d.summary_json,'') IS NOT NULL) THEN 0 "
+        "WHEN EXISTS (SELECT 1 FROM video_summary_jobs j WHERE j.task_id=t.task_id "
+        "AND j.status IN ('queued','running')) THEN 1 ELSE 2 END, "
+        "CASE t.status WHEN 'completed' THEN 0 WHEN 'downloading' THEN 1 "
+        "WHEN 'pending' THEN 2 ELSE 3 END, t.created_at DESC",
+        (aweme_id,),
+    )
+    conflict = None
+    busy_parent = False
+    for task_id, task_type, video_status in rows:
+        task = await task_manager.get_task(task_id)
+        if not task:
+            continue
+        handle = running_download_tasks.get(task_id)
+        active = task.status == "downloading" or (handle is not None and not handle.done())
+        if active and task_type in {"single", "batch_item"}:
+            continue
+        if active and video_status != "downloaded":
+            busy_parent = True
+            continue
+        try:
+            path = await _resolve_task_video_path(task, "复用下载", aweme_id=aweme_id, require_completed=False)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                continue
+            if exc.status_code == 409:
+                conflict = exc
+                continue
+            raise
+        if task_type in {"post", "mix", "mix_user"}:
+            # 旧批量记录只创建隐藏引用，不重复展示一张单视频卡片。
+            await task_manager.db.update_video_status(task_id, aweme_id, "downloaded", file_path=str(path), file_size=path.stat().st_size)
+            return await _materialize_batch_video_task_reference(f"{task_id}::{aweme_id}")
+        return task_id
+    if conflict:
+        raise conflict
+    if busy_parent:
+        raise HTTPException(status_code=409, detail={
+            "code": "DOWNLOAD_QUEUE_PARENT_BUSY", "message": "该作品仍在旧批量任务中下载，未重复提交",
+            "action": "等待旧批量任务结束后继续队列",
+        })
+    if local_only:
+        # 预检不能创建空任务、读取 Cookie 或请求抖音；无记录时只查本地孤立文件。
+        if rows or skill is None:
+            return None
+        root = Path(skill.douyin_conf.get("path", "Download")).expanduser().resolve()
+        try:
+            await asyncio.to_thread(_find_task_video_file, root, [], [aweme_id])
+        except (FileNotFoundError, RuntimeError):
+            return None
+    for task_id, task_type, _ in rows:
+        if task_type in {"single", "batch_item"}:
+            return task_id
+    if skill is None:
+        raise RuntimeError("下载服务尚未初始化")
+    task = await task_manager.create_single_task(
+        aweme_id=aweme_id,
+        video_info={"aweme_id": aweme_id, "desc": f"视频 {aweme_id}", "nickname": author, "sec_user_id": profile_id or None},
+        download_path=skill.douyin_conf.get("path", "Download"),
+    )
+    return task.id
+
+
+async def _try_reuse_queued_download(task: Any, aweme_id: str, auto_summary: bool) -> Optional[Dict[str, Any]]:
+    """只复用本地文件，可提交独立总结作业，绝不发起抖音下载。"""
+    task_id = task.id
+    running = running_download_tasks.get(task_id)
+    if task.status != "downloading" and (running is None or running.done()):
+        try:
+            path = await _resolve_task_video_path(task, "复用下载", aweme_id=aweme_id, require_completed=False)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                return {"status": "failed", "task_id": task_id, "error": {
+                    "code": "VIDEO_FILE_AMBIGUOUS", "reason": "本地文件无法唯一匹配，已暂停以免重复下载",
+                    "action": "在任务记录中补充精确文件路径，或保留唯一视频文件后继续队列",
+                }}
+        else:
+            await task_manager.db.update_video_status(task_id, aweme_id, "downloaded", file_path=str(path), file_size=path.stat().st_size)
+            await task_manager.db.update_task_counts(task_id, total=1, downloaded=1, skipped=0, failed=0)
+            await task_manager.db.update_task_progress(task_id, percentage=100, current_video_name="已复用本地视频，跳过下载")
+            if task.status != "completed":
+                await task_manager.update_task_status(task_id, "completed")
+            if auto_summary:
+                await _start_auto_video_summary(task_id)
+            return {"status": "completed", "task_id": task_id, "skipped": True}
+    return None
+
+
+async def _preflight_queued_download(aweme_id: str, author: str, profile_id: str, auto_summary: bool) -> Optional[str]:
+    """冷却期间提前查重；没有确定的本地文件时留待正常出队处理。"""
+    try:
+        task_id = await _prepare_queued_download(aweme_id, author, profile_id, local_only=True)
+        task = await task_manager.get_task(task_id) if task_id else None
+        result = await _try_reuse_queued_download(task, aweme_id, auto_summary) if task else None
+    except HTTPException:
+        return None
+    return task_id if result and result.get("skipped") is True else None
+
+
+async def _execute_queued_download(task_id: str, aweme_id: str, auto_summary: bool) -> Dict[str, Any]:
+    """复用现有下载与自动总结；下载完成不等待模型分析结束。"""
+    task = await task_manager.get_task(task_id)
+    if task is None:
+        return {"status": "missing", "task_id": task_id}
+    reused = await _try_reuse_queued_download(task, aweme_id, auto_summary)
+    if reused is not None:
+        return reused
+    try:
+        _check_download_queue_config(auto_summary)
+    except HTTPException as exc:
+        cookie_missing = exc.status_code == 401
+        error = {"code": "COOKIE_REQUIRED" if cookie_missing else "DOWNLOAD_QUEUE_CONFIG_INVALID",
+                 "reason": "抖音登录状态无效" if cookie_missing else "下载或视频总结配置未就绪",
+                 "action": "请在看板点击扫码登录，再继续队列" if cookie_missing else "检查本地下载与视频总结配置后继续队列"}
+        await _mark_task_failed(task_id, stage="download", aweme_id=aweme_id, **error)
+        return {"status": "failed", "task_id": task_id, "error": error}
+
+    running = running_download_tasks.get(task_id)
+    if running is None or running.done():
+        if task.status == "completed":
+            # 本地媒体已缺失时复用记录重新下载，不沿用上次的 100% 进度。
+            await task_manager.db.update_task_counts(task_id, total=1, downloaded=0, skipped=0, failed=0)
+            await task_manager.db.update_task_progress(task_id, percentage=0, current_video_name="等待重新下载缺失文件")
+        elif task.status in {"failed", "cancelled"}:
+            await task_manager.retry_task(task_id)
+        _schedule_download(task_id, _download_video_task(
+            task_id, aweme_id, task.base_path or skill.douyin_conf.get("path", "Download"),
+            auto_summary=auto_summary, pause_on_rejection=True,
+        ))
+        running = running_download_tasks[task_id]
+    elif auto_summary:
+        auto_summary_requested.add(task_id)
+    # 队列停机时先保存恢复位置；具体下载由统一关闭流程处理。
+    try:
+        await asyncio.shield(running)
+    except asyncio.CancelledError:
+        if asyncio.current_task().cancelling():
+            raise
+    task = await task_manager.get_task(task_id)
+    status = task.status if task else "failed"
+    error = None
+    if status != "completed":
+        blocked = bool(task and task.error and _download_status_code(task.error) in {401, 403, 429})
+        error = {"code": "DOWNLOAD_QUEUE_BLOCKED" if blocked else "DOWNLOAD_QUEUE_ITEM_FAILED",
+                 "reason": "下载请求被拒绝或限速，已暂停整批" if blocked else "该视频下载未完成，已暂停整批",
+                 "action": "检查登录状态，必要时扫码登录；等待后再继续，暂勿批量重试" if blocked else "在任务卡片查看错误，处理后点击继续队列重试该项"}
+    return {"status": status, "task_id": task_id, "error": error}
+
+
+app.include_router(create_download_queue_router(lambda: download_queue, _check_download_queue_config))
 
 
 def _schedule_download(task_id: str, coroutine: Coroutine[Any, Any, None]) -> None:
@@ -456,7 +639,7 @@ async def _start_auto_video_summary(task_id: str) -> None:
         print(f"[DY-WEB] 自动视频总结启动失败: task_id={task_id[:8]}..., 类型={type(exc).__name__}")
 
 
-async def _download_video_task(task_id: str, aweme_id: str, download_path: str, auto_summary: bool = False):
+async def _download_video_task(task_id: str, aweme_id: str, download_path: str, auto_summary: bool = False, pause_on_rejection: bool = False):
     """后台下载视频任务"""
     try:
         if skill is None:
@@ -495,6 +678,7 @@ async def _download_video_task(task_id: str, aweme_id: str, download_path: str, 
             task_id=task_id,
             progress_percentage=0,
             label="单视频下载",
+            pause_on_rejection=pause_on_rejection,
         )
 
         # 更新任务结果
@@ -919,7 +1103,7 @@ async def _distill_summarize_item(job_id: str, path: Path, progress: Any) -> Dic
 @app.on_event("startup")
 async def startup_event():
     """服务启动时初始化Skill"""
-    global skill, distill_service
+    global skill, distill_service, download_queue
     skill = DouyinDownloadSkill()
     print("[DY-WEB] DouyinDownloadSkill 初始化完成")
 
@@ -944,11 +1128,21 @@ async def startup_event():
     recovered = await distill_service.recover_after_restart()
     if recovered:
         print(f"[DY-WEB] 已将 {recovered} 个蒸馏运行标记为暂停")
+    download_queue = PersistentDownloadQueue(
+        task_manager.db.db_path, _prepare_queued_download, _execute_queued_download,
+        reuse_item=_preflight_queued_download,
+    )
+    await download_queue.initialize()
+    await download_queue.start()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """服务关闭时清理"""
+    global download_queue
+    if download_queue:
+        await download_queue.shutdown()
+        download_queue = None
     active_downloads = list(running_download_tasks.values())
     for download_task in active_downloads:
         if not download_task.done():
@@ -1810,8 +2004,11 @@ def _safe_video_candidate(candidate: Path, root: Path) -> Optional[Path]:
         resolved.relative_to(root)
     except (OSError, ValueError):
         return None
-    if resolved.is_file() and resolved.suffix.lower() in VIDEO_SUFFIXES:
-        return resolved
+    try:
+        if resolved.is_file() and resolved.suffix.lower() in VIDEO_SUFFIXES and resolved.stat().st_size > 0:
+            return resolved
+    except OSError:
+        return None
     return None
 
 
@@ -1915,11 +2112,11 @@ def _find_media_candidates(search_root: Path, requested_name: str, requested_ste
     return sorted(anchored_id_matches, key=lambda item: str(item))
 
 
-async def _resolve_task_video_path(task: Any, feature_name: str = "口播提取", aweme_id: Optional[str] = None) -> Path:
+async def _resolve_task_video_path(task: Any, feature_name: str = "口播提取", aweme_id: Optional[str] = None, *, require_completed: bool = True) -> Path:
     """Resolve the task's local video without leaving the configured root."""
     if task.type not in {TaskType.SINGLE.value, "batch_item"} and not aweme_id:
         raise HTTPException(status_code=422, detail={"code": "VIDEO_FEATURE_SINGLE_ONLY", "message": f"{feature_name}目前只支持已完成的单视频任务", "action": "请在单视频任务上操作"})
-    if task.status != TaskStatus.COMPLETED.value:
+    if require_completed and task.status != TaskStatus.COMPLETED.value:
         raise HTTPException(status_code=409, detail={"code": "VIDEO_FEATURE_TASK_NOT_READY", "message": f"视频尚未下载完成，暂时无法{feature_name}", "action": "等待任务完成后重试"})
     root = Path(skill.douyin_conf.get("path", "Download")).expanduser().resolve() if skill else Path("Download").resolve()
     videos = await task_manager.db.get_task_videos(task.id)
@@ -2810,6 +3007,10 @@ async def export_video_summary(job_id: str, format: str = Query("md", pattern="^
             lines.extend(["", "## 受众与意图", f"- 可能受众：{audience.get('likely_audience') or '未明确'}", f"- 传播意图：{audience.get('communication_intent') or '未明确'}", f"- 整体语气：{audience.get('tone') or '未明确'}"])
         if summary.get("reusable_elements"):
             lines.extend(["", "## 可复用要素", *[f"- {item}" for item in summary["reusable_elements"]]])
+        comment_ideas = normalize_comment_ideas(summary.get("comment_ideas"))
+        if comment_ideas:
+            lines.extend(["", "## 神评论灵感", "", "以下为 AI 生成的评论候选，可按语气调整后使用。", ""])
+            lines.extend(f"- {item['style']}：{item['text']}" for item in comment_ideas)
         content = "\n".join(lines)
         media_type = "text/markdown; charset=utf-8" if format == "md" else "text/plain; charset=utf-8"
         filename = f"{job['task_id']}-video-summary.{format}"

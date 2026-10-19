@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from skills.douyin_downloader.video_summary_service import (
     VideoProbe,
     VideoSummaryService,
     _parse_summary_response,
+    normalize_comment_ideas,
     serialize_summary_error,
 )
 
@@ -24,6 +26,45 @@ def test_summary_config_requires_https_and_key():
     with pytest.raises(RuntimeError, match="HTTPS"):
         VideoSummaryService(SummaryConfig(base_url="http://api.text168.com/v1beta", api_key="key")).validate_config()
     VideoSummaryService(SummaryConfig(api_key="key")).validate_config()
+
+
+@pytest.mark.asyncio
+async def test_summary_service_runs_five_in_parallel_without_download_cooldown(tmp_path, monkeypatch):
+    service = VideoSummaryService(SummaryConfig(api_key="test"))
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"mock-video")
+    five_started, release = asyncio.Event(), asyncio.Event()
+    started, active, peak = [], 0, 0
+
+    async def prepare(job_id, path, directory, callback):
+        return VideoPreparation("direct", path, [path], 10, 10)
+
+    async def generate(job_id, path, prompt):
+        nonlocal active, peak
+        started.append(job_id)
+        active += 1
+        peak = max(peak, active)
+        if active == 5:
+            five_started.set()
+        try:
+            await release.wait()
+            return {"title": "测试总结"}
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(service, "_prepare_video", prepare)
+    monkeypatch.setattr(service, "_generate_parsed", generate)
+    jobs = [asyncio.create_task(service.summarize_video(f"job-{index}", video)) for index in range(6)]
+    try:
+        await asyncio.wait_for(five_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert len(started) == 5 and peak == 5
+        release.set()
+        results = await asyncio.gather(*jobs)
+        assert len(results) == 6 and peak == 5
+    finally:
+        release.set()
+        await asyncio.gather(*jobs, return_exceptions=True)
 
 
 def test_fallback_model_defaults_to_gemini_25_flash(monkeypatch):
@@ -104,6 +145,97 @@ def test_summary_prompt_requests_detailed_research_fields():
     assert "narrative_structure" in prompt
     assert "editing_and_expression" in prompt
     assert "reusable_elements" in prompt
+
+
+def test_summary_prompt_separates_original_comment_ideas_from_facts():
+    prompt = VideoSummaryService(SummaryConfig(api_key="key"))._summary_prompt()
+    example = json.loads(prompt.split("JSON 形状示例", 1)[1].split("：", 1)[1].split("}。", 1)[0] + "}")
+    assert {entry["style"] for entry in example["comment_ideas"]} == {"搞笑有梗", "抒情共鸣", "金句"}
+    assert all(isinstance(entry["text"], str) for entry in example["comment_ideas"])
+    assert "通常给 6 条，每类 2 条" in prompt
+    assert "贴合原片具体细节" in prompt
+    assert "不是真实评论或原话" in prompt
+    assert "不虚构人物经历，不保证高赞" in prompt
+    assert "除 comment_ideas 创作区外，只陈述视频中看见或听见的内容" in prompt
+
+
+@pytest.mark.parametrize("value", [None, "一句评论", {"style": "金句", "text": "一句评论"}, 1, True])
+def test_comment_ideas_reject_unrecognized_collection_shapes(value):
+    assert normalize_comment_ideas(value) == []
+
+
+def test_comment_ideas_normalize_valid_rows_without_stringifying_objects():
+    value = [
+        {"style": " 搞笑有梗 ", "text": " 这转场，比我下班还利索。 ", "extra": "忽略"},
+        {"style": "金句", "text": "这转场，比我下班还利索。"},
+        {"style": "抒情共鸣", "text": "原来那一盏灯，一直在等你。"},
+        {"style": "金句", "text": " "},
+        {"style": "其他", "text": "不支持的类型"},
+        {"style": ["金句"], "text": "类型不是字符串"},
+        {"style": "金句", "text": {"content": "正文不是字符串"}},
+        {"style": "金句", "text": 42},
+        {"style": "金句"},
+        "不是对象",
+        None,
+    ]
+    assert normalize_comment_ideas(value) == [
+        {"style": "搞笑有梗", "text": "这转场，比我下班还利索。"},
+        {"style": "抒情共鸣", "text": "原来那一盏灯，一直在等你。"},
+    ]
+    assert value[0]["style"] == " 搞笑有梗 "
+
+
+def test_comment_ideas_keep_at_most_six_distinct_texts():
+    values = [{"style": "金句", "text": f"原创评论 {index}"} for index in range(8)]
+    assert normalize_comment_ideas(values) == values[:6]
+
+
+def test_summary_response_normalizes_comment_ideas_and_accepts_legacy():
+    def parse(payload):
+        return _parse_summary_response({"candidates": [{"content": {"parts": [{"text": json.dumps(payload, ensure_ascii=False)}]}}]})
+
+    parsed = parse({"title": "视频", "comment_ideas": [
+        {"style": " 金句 ", "text": " 灯亮起来，家就有了方向。 "},
+        {"style": "金句", "text": {"text": "不应显示的对象"}},
+    ]})
+    assert parsed["comment_ideas"] == [{"style": "金句", "text": "灯亮起来，家就有了方向。"}]
+    assert parse({"title": "旧结果"})["comment_ideas"] == []
+    assert parse({"title": "异常字段", "comment_ideas": {"text": "不是数组"}})["comment_ideas"] == []
+
+
+@pytest.mark.asyncio
+async def test_segment_merge_regenerates_comment_ideas_without_extra_requests(tmp_path, monkeypatch):
+    service = VideoSummaryService(SummaryConfig(api_key="key"))
+    paths = [tmp_path / "part-1.mp4", tmp_path / "part-2.mp4"]
+    requests = []
+    final_ideas = [
+        {"style": " 搞笑有梗 ", "text": " 最后这一下，连反转都没反应过来。 "},
+        {"style": "金句", "text": "最后这一下，连反转都没反应过来。"},
+        {"style": "抒情共鸣", "text": "所有的铺垫，都是为了这一刻的相遇。"},
+    ]
+
+    async def request(job_id, video_path, prompt):
+        requests.append((video_path, prompt))
+        payload = {
+            "title": "完整分析" if video_path is None else "片段分析",
+            "comment_ideas": final_ideas if video_path is None else [{"style": "金句", "text": f"片段评论 {len(requests)}"}],
+        }
+        return {"candidates": [{"content": {"parts": [{"text": json.dumps(payload, ensure_ascii=False)}]}}]}
+
+    monkeypatch.setattr(service, "_request_generate", request)
+    monkeypatch.setattr(service, "_probe_video", lambda _path: _resolved(VideoProbe(30, 640, 360, True)))
+    result = await service._summarize_segments("job", VideoPreparation("chunked", tmp_path / "video.mp4", paths, 20, 10), None)
+    assert len(requests) == 3
+    assert [item[0] for item in requests] == [*paths, None]
+    combine_prompt = requests[-1][1]
+    assert "围绕完整视频重新整理、去重" in combine_prompt
+    assert "不是真实评论或原话" in combine_prompt
+    assert "style" in combine_prompt and "text" in combine_prompt
+    assert "片段评论 1" in combine_prompt and "片段评论 2" in combine_prompt
+    assert result["comment_ideas"] == [
+        {"style": "搞笑有梗", "text": "最后这一下，连反转都没反应过来。"},
+        {"style": "抒情共鸣", "text": "所有的铺垫，都是为了这一刻的相遇。"},
+    ]
 
 
 def test_summary_response_parser_preserves_detailed_fields_and_defaults_legacy():

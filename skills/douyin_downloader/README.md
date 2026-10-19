@@ -8,6 +8,8 @@ Web 工作台支持对已完成的单视频任务提取口播文案，也支持�
 
 视频总结按新网关 `gemini-3.8-flash` → text168 → `gemini-2.5-flash` 保底的顺序切换。新网关使用 `DOUYIN_VIDEO_SUMMARY_GATEWAY_BASE_URL`、`DOUYIN_VIDEO_SUMMARY_GATEWAY_MODEL`，默认地址为已验证支持 Gemini 原生协议的 `https://api.aigateway.online/v1beta`；其 `/v1` 地址是 OpenAI 兼容协议。原主接口使用 `DOUYIN_VIDEO_SUMMARY_BASE_URL`、`DOUYIN_VIDEO_SUMMARY_MODEL`；保底接口使用 `DOUYIN_VIDEO_SUMMARY_FALLBACK_BASE_URL`、`DOUYIN_VIDEO_SUMMARY_FALLBACK_MODEL`。API Key 只放在 macOS Keychain（服务名分别为 `douyin-downloader-summary-aigateway`、`douyin-downloader-text168`、`douyin-downloader-summary-fallback`）中，不要提交到仓库、前端、数据库或日志。
 通道选择只在当前作业内保持；服务重启后会从主通道重新尝试。失败作业仅记录通道、模型、HTTP 状态和视频准备体积，不保存请求体。
+自动视频总结在每条下载完成后立即提交，服务级最多 5 个并发；下载队列的 30 秒冷却不限制总结，也不等待总结结束。
+新生成的视频总结包含「神评论灵感」：根据视频内容提供搞笑有梗、抒情共鸣和金句类原创候选，可逐条复制，并随单视频及作者汇总 Markdown 一同导出。评论在同一次总结请求中生成；已有总结不会自动重做，可点击「重新总结」生成新版内容。
 
 博主归纳超时由 `DOUYIN_DISTILL_SYNTHESIS_TIMEOUT` 控制，默认 300 秒。归纳响应只记录长度、结束原因和用量，不保存模型返回正文。
 批量下载连续 403 熔断阈值由 `DOUYIN_DISTILL_DOWNLOAD_CIRCUIT_BREAKER` 控制，默认 5 条；口播最低信息量由 `DOUYIN_DISTILL_MIN_TRANSCRIPT_CHARS` 控制，默认 150 字，设为 0 可关闭。画面总结的中文占比下限由 `DOUYIN_DISTILL_MIN_SUMMARY_CJK_RATIO` 控制，默认 0.15。

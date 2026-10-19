@@ -27,6 +27,38 @@ except ImportError:
 ProgressCallback = Callable[[str, int], Awaitable[None]]
 
 
+_COMMENT_IDEA_STYLES = frozenset({"搞笑有梗", "抒情共鸣", "金句"})
+_COMMENT_IDEAS_GUIDANCE = (
+    "comment_ideas 是独立的神评论灵感创作区，元素必须是 {\"style\":\"搞笑有梗|抒情共鸣|金句\",\"text\":\"可直接发布的短评论\"}，"
+    "style 只能选择其中一种。通常给 6 条，每类 2 条；某类不适合原片时可以少给，最多 6 条。"
+    "评论必须贴合原片具体细节，语气自然：搞笑有梗、抒情共鸣或精练金句，避免套话和重复。"
+    "优先一句话、10-45 个中文字，像观众随手留下的评论；搞笑类抓反差、巧妙接梗，抒情类抓细节和共鸣，金句类要精练有记忆点，避免复述摘要、万能夸赞和强行玩梗。"
+    "这是基于原片的 AI 原创候选，不是真实评论或原话，不虚构人物经历，不保证高赞；必须与事实分析区分。"
+)
+
+
+def normalize_comment_ideas(value: Any) -> list[dict[str, str]]:
+    """保留可直接展示的原创评论候选，兼容没有该字段的旧总结。"""
+    if not isinstance(value, list):
+        return []
+    ideas: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        style, text = entry.get("style"), entry.get("text")
+        if not isinstance(style, str) or not isinstance(text, str):
+            continue
+        style, text = style.strip(), text.strip()
+        if style not in _COMMENT_IDEA_STYLES or not text or text in seen:
+            continue
+        ideas.append({"style": style, "text": text})
+        seen.add(text)
+        if len(ideas) == 6:
+            break
+    return ideas
+
+
 @dataclass(frozen=True)
 class SummaryConfig:
     gateway_base_url: str = "https://api.aigateway.online/v1beta"
@@ -162,7 +194,7 @@ class VideoSummaryService:
         self._job_provider_indexes: Dict[str, int] = {}
         self._job_attempts: Dict[str, list[Dict[str, Any]]] = {}
         self._job_segment_indexes: Dict[str, int] = {}
-        self._concurrency = asyncio.Semaphore(2)
+        self._concurrency = asyncio.Semaphore(5)
 
     def validate_config(self) -> None:
         providers = self._providers()
@@ -433,7 +465,7 @@ class VideoSummaryService:
         return (
             prefix + "请做一份有细节、可复核、适合内容研究的中文视频分析，不要只写泛泛的摘要。"
             "按视频实际顺序覆盖开场、发展、转折/冲突、高潮、结尾；说明人物做了什么、画面如何变化、"
-            "听到了哪些口播/对白、剪辑和表达如何服务主题。只陈述视频中看见或听见的内容，无法确认的地方明确写入 uncertainties，绝不补写常识或猜测。"
+            "听到了哪些口播/对白、剪辑和表达如何服务主题。除 comment_ideas 创作区外，只陈述视频中看见或听见的内容，无法确认的地方明确写入 uncertainties，绝不补写常识或猜测。"
             "请严格只返回 JSON，不要 Markdown 代码块。字段必须包含："
             "title（准确标题）、one_sentence（一句话概括）、overview（至少 3 段；在信息足够时不少于 180 个中文字符，"
             "按起因-经过-结果完整叙述）、"
@@ -456,7 +488,10 @@ class VideoSummaryService:
             '"narrative_structure":{"hook":"开场","setup":"背景","development":"发展","turning_point":"转折","climax":"高潮","ending":"结尾"},'
             '"emotional_arc":["平静到紧张，依据是画面与声音"],"editing_and_expression":["具体剪辑手法"],'
             '"audience_and_intent":{"likely_audience":"受众","communication_intent":"意图","tone":"语气"},'
-            '"reusable_elements":["有原片依据的要素"],"keywords":["关键词"],"uncertainties":["无法确认事项"]}。'
+            '"reusable_elements":["有原片依据的要素"],"keywords":["关键词"],"uncertainties":["无法确认事项"],'
+            '"comment_ideas":[{"style":"搞笑有梗","text":"贴合具体画面的原创短评论"},'
+            '{"style":"抒情共鸣","text":"由原片细节引发的原创感受"},{"style":"金句","text":"精练的原创表达"}]}。'
+            + _COMMENT_IDEAS_GUIDANCE
         )
 
     async def _request_generate(self, job_id: str, video_path: Optional[Path], prompt: str) -> Dict[str, Any]:
@@ -572,7 +607,9 @@ class VideoSummaryService:
         combine_prompt = (
             "请把下面多个连续视频片段的 JSON 分析合并成一份详细、去重、按原视频时间排序的中文视频总结。"
             "保留并补全完整视频的起因-经过-结果、转折、情绪变化、镜头与声音表达；overview 写成连贯的多段文字，"
-            "timeline 合并为具体时间线，所有结论只能来自片段内容。只返回与片段相同字段的 JSON，不要添加 Markdown。"
+            "timeline 合并为具体时间线，事实分析的所有结论只能来自片段内容。只返回与片段相同字段的 JSON，不要添加 Markdown。"
+            "comment_ideas 必须围绕完整视频重新整理、去重，不要直接堆叠各片段的评论。"
+            + _COMMENT_IDEAS_GUIDANCE +
             "片段分析如下：\n" + json.dumps(summaries, ensure_ascii=False)
         )
         await self._update(callback, "combining_segments", 85)
@@ -662,6 +699,7 @@ def _parse_summary_response(response: Dict[str, Any], model: str = "gemini-3.7-f
     parsed.setdefault("title", "视频总结")
     parsed.setdefault("one_sentence", parsed.get("overview", ""))
     parsed.setdefault("overview", "")
+    parsed["comment_ideas"] = normalize_comment_ideas(parsed.get("comment_ideas"))
     shape_issues = {}
     for field in ("key_points", "timeline", "visual_content", "spoken_content", "people_and_objects", "emotional_arc", "editing_and_expression", "reusable_elements", "keywords", "uncertainties"):
         if not isinstance(parsed.get(field), list):

@@ -46,6 +46,17 @@ def test_id_prefix_is_anchored_not_fuzzy(tmp_path: Path):
         _find_task_video_file(tmp_path, [], ["12345"])
 
 
+def test_rejects_empty_temporary_and_symlink_escape_files(tmp_path: Path):
+    (tmp_path / "12345_empty.mp4").write_bytes(b"")
+    (tmp_path / "12345_video.mp4.part").write_bytes(b"partial")
+    (tmp_path / "12345_video.tmp").write_bytes(b"partial")
+    outside = tmp_path.parent / "outside.mp4"
+    outside.write_bytes(b"outside-video")
+    (tmp_path / "12345_link.mp4").symlink_to(outside)
+    with pytest.raises(FileNotFoundError):
+        _find_task_video_file(tmp_path, [], ["12345"])
+
+
 def test_media_lookup_prefers_exact_video_over_aweme_companion_files(tmp_path: Path):
     folder = tmp_path / "title-folder"
     folder.mkdir()

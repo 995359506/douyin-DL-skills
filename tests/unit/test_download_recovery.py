@@ -69,3 +69,32 @@ async def test_retry_clears_previous_attempt_progress(tmp_path):
         assert stored.current_video_name == "等待重试失败项"
     finally:
         await manager.db.close()
+
+
+@pytest.mark.parametrize("status", [401, 403, 429])
+async def test_queue_rejections_do_not_repeat_requests(monkeypatch, status):
+    operation = AsyncMock(return_value={"success": False, "status_code": status, "message": f"HTTP {status}"})
+    progress = AsyncMock()
+    monkeypatch.setattr(web, "_update_task_progress", progress)
+    result = await web._download_with_auto_retry(
+        operation, task_id="task", progress_percentage=0, label="批次下载", pause_on_rejection=True,
+    )
+    assert not result["success"]
+    operation.assert_awaited_once()
+    progress.assert_not_awaited()
+    assert "自动重试" not in result["message"]
+
+
+async def test_queue_transient_errors_use_bounded_exponential_backoff(monkeypatch):
+    operation = AsyncMock(return_value={"success": False, "status_code": 503, "message": "HTTP 503"})
+    sleep = AsyncMock()
+    monkeypatch.setattr(web, "_update_task_progress", AsyncMock())
+    monkeypatch.setattr(web, "DOWNLOAD_AUTO_RETRY_MAX", 3)
+    monkeypatch.setattr(web, "DOWNLOAD_AUTO_RETRY_DELAY", 10)
+    monkeypatch.setattr(web.asyncio, "sleep", sleep)
+    result = await web._download_with_auto_retry(
+        operation, task_id="task", progress_percentage=0, label="批次下载", pause_on_rejection=True,
+    )
+    assert operation.await_count == 4
+    assert [call.args[0] for call in sleep.await_args_list] == [10, 20, 40]
+    assert "自动重试 3 次" in result["message"]

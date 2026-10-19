@@ -54,6 +54,73 @@ async def test_single_download_auto_summary_only_after_success(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_download_success_starts_each_summary_without_waiting_for_model(monkeypatch):
+    """下载成功即提交单条总结，模型未返回也不阻塞下一条下载。"""
+    jobs = {}
+    statuses = []
+    started = set()
+    both_started = asyncio.Event()
+    release_model = asyncio.Event()
+    handles = {}
+
+    class FakeDB:
+        update_task_counts = AsyncMock()
+        get_latest_distill_result_for_task = AsyncMock(return_value=None)
+
+        async def get_video_summary_job(self, *, task_id=None, job_id=None):
+            return jobs.get(job_id) if job_id else next(
+                (job for job in jobs.values() if job["task_id"] == task_id), None
+            )
+
+        async def create_video_summary_job(self, job_id, task_id, _model, _input_bytes):
+            jobs[job_id] = {"job_id": job_id, "task_id": task_id, "status": "queued"}
+
+    class FakeManager:
+        db = FakeDB()
+
+        async def update_task_status(self, task_id, status):
+            statuses.append((task_id, status))
+
+        async def get_task(self, task_id):
+            return SimpleNamespace(id=task_id)
+
+    async def hold_summary(job_id, _task_id, _video_path):
+        started.add(job_id)
+        if len(started) == 2:
+            both_started.set()
+        await release_model.wait()
+
+    identifiers = iter(("summary-first", "summary-second"))
+    monkeypatch.setattr(web, "skill", SimpleNamespace(download_single_video=AsyncMock()))
+    monkeypatch.setattr(web, "task_manager", FakeManager())
+    monkeypatch.setattr(web, "_download_with_auto_retry", AsyncMock(return_value={"success": True}))
+    monkeypatch.setattr(web, "_materialize_batch_video_task_reference", AsyncMock(side_effect=lambda value: value))
+    monkeypatch.setattr(web, "_resolve_task_video_path", AsyncMock(return_value=SimpleNamespace(
+        stat=lambda: SimpleNamespace(st_size=123)
+    )))
+    monkeypatch.setattr(web, "video_summary_service", SimpleNamespace(
+        validate_config=lambda: None, config=SimpleNamespace(model="模拟模型")
+    ))
+    monkeypatch.setattr(web, "new_summary_job_id", lambda: next(identifiers))
+    monkeypatch.setattr(web, "_run_video_summary_job", hold_summary)
+    monkeypatch.setattr(web, "running_summary_tasks", handles)
+
+    try:
+        for task_id in ("first", "second"):
+            await asyncio.wait_for(web._download_video_task(
+                task_id, "123", "/tmp/mock", auto_summary=True
+            ), timeout=1)
+            assert statuses[-1] == (task_id, "completed")
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        assert set(started) == {"summary-first", "summary-second"}
+        assert all(not handle.done() for handle in handles.values())
+        assert {job["task_id"] for job in jobs.values()} == {"first", "second"}
+    finally:
+        release_model.set()
+        await asyncio.gather(*handles.values())
+
+
+@pytest.mark.asyncio
 async def test_auto_summary_start_failure_keeps_download_completed(monkeypatch):
     statuses = []
     errors = []
@@ -274,8 +341,16 @@ def test_request_models_use_safe_defaults_and_validate_inputs():
     assert _safe_directory_component("../bad/name", "fallback") == "bad_name"
 
 
+@pytest.fixture
+def _offline_douyin_token(monkeypatch):
+    """F2 模型导入时也会生成令牌，必须在导入爬虫前替换网络调用。"""
+    from f2.apps.douyin.utils import TokenManager
+
+    monkeypatch.setattr(TokenManager, "gen_real_msToken", classmethod(lambda _cls: "offline-ms-token"))
+
+
 @pytest.mark.asyncio
-async def test_user_post_scan_retries_from_last_cursor_without_download(monkeypatch):
+async def test_user_post_scan_retries_from_last_cursor_without_download(monkeypatch, _offline_douyin_token):
     """Transient page failures retry the saved cursor without profile refetches."""
 
     class FakeSkill:
@@ -357,7 +432,7 @@ async def test_user_post_scan_retries_from_last_cursor_without_download(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_user_post_scan_reports_403_without_retry_or_cookie_claim(monkeypatch):
+async def test_user_post_scan_reports_403_without_retry_or_cookie_claim(monkeypatch, _offline_douyin_token):
     class FakeSkill:
         douyin_conf = {"timeout": 10, "page_counts": 20}
 

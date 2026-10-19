@@ -85,6 +85,7 @@
         @submitted="handleUserScanSubmitted"
       />
 
+      <DownloadBatchQueue />
       <DownloadRecords />
     </main>
 
@@ -97,6 +98,7 @@ import { ElCheckbox, ElMessage, ElMessageBox } from 'element-plus'
 import { storeToRefs } from 'pinia'
 import { useDownloadStore } from '@/stores/download'
 import DownloadRecords from '@/components/DownloadRecords.vue'
+import DownloadBatchQueue from '@/components/DownloadBatchQueue.vue'
 import DouyinShareInput from '@/components/DouyinShareInput.vue'
 import UserPostScanner from '@/components/UserPostScanner.vue'
 import { classifyUniversalInput, classifyUniversalUrl, hasConfirmedMultiVideoMix } from '@/utils/universalRouting'

@@ -488,7 +488,11 @@ class DistillSynthesis:
         current_chars = 0
         for item in usable:
             metadata = item.get("metadata") or {}
-            payload = {"source": _source_id(item), "kind": "image_text" if metadata.get("kind") == "image" else "video", "title": metadata.get("title"), "summary": item.get("summary") or {}, "transcript": item.get("polished_text") or ""}
+            summary = item.get("summary") or {}
+            if isinstance(summary, dict):
+                # 原创评论保留在单视频总结中，不作为跨视频事实归纳资料。
+                summary = {key: value for key, value in summary.items() if key != "comment_ideas"}
+            payload = {"source": _source_id(item), "kind": "image_text" if metadata.get("kind") == "image" else "video", "title": metadata.get("title"), "summary": summary, "transcript": item.get("polished_text") or ""}
             size = len(_json(payload))
             if current and current_chars + size > self.max_chars:
                 groups.append(current)

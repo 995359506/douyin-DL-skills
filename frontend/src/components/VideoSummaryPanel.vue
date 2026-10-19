@@ -40,6 +40,19 @@
           <p class="summary-one-sentence">{{ job.summary.one_sentence }}</p>
           <p class="summary-overview">{{ job.summary.overview }}</p>
         </el-tab-pane>
+        <el-tab-pane label="神评论灵感" name="comments">
+          <p class="comment-intro">AI 生成的评论灵感，可按语气调整后使用。</p>
+          <ul v-if="commentIdeas.length" class="comment-ideas">
+            <li v-for="(idea, index) in commentIdeas" :key="`comment-${index}`" class="comment-idea">
+              <div class="comment-idea-header">
+                <span class="comment-style">{{ idea.style }}</span>
+                <el-button text @click="copyComment(idea.text)"><el-icon><CopyDocument /></el-icon>复制</el-button>
+              </div>
+              <p>{{ idea.text }}</p>
+            </li>
+          </ul>
+          <p v-else class="empty-summary">{{ commentIdeasEmptyText }}</p>
+        </el-tab-pane>
         <el-tab-pane label="关键要点" name="points">
           <ul class="summary-list"><li v-for="(item, index) in job.summary.key_points" :key="`point-${index}`">{{ item }}</li></ul>
           <p v-if="!job.summary.key_points.length" class="empty-summary">暂无关键要点</p>
@@ -106,6 +119,7 @@ import { computed, ref, watch, onBeforeUnmount } from 'vue'
 import { ElMessage } from 'element-plus'
 import { CopyDocument, Document, Download, Loading, RefreshRight } from '@element-plus/icons-vue'
 import { douyinApi } from '@/api'
+import { normalizeCommentIdeas, commentIdeasForCopy, type CommentIdea } from '@/utils/videoSummaryComments'
 
 interface SummaryData {
   title: string
@@ -121,6 +135,7 @@ interface SummaryData {
   editing_and_expression?: string[]
   audience_and_intent?: { likely_audience?: string; communication_intent?: string; tone?: string }
   reusable_elements?: string[]
+  comment_ideas?: CommentIdea[]
 }
 
 interface SummaryJob {
@@ -170,6 +185,10 @@ const timelineContent = (item: SummaryData['timeline'][number]) => {
 const personText = (item: NonNullable<SummaryData['people_and_objects']>[number]) => typeof item === 'string' ? item : [item.name, item.role_or_relation, item.appearance_or_action].filter(Boolean).join('：')
 const narrativeLabels: Record<string, string> = { hook: '开场钩子', setup: '背景铺垫', development: '发展', turning_point: '转折/冲突', climax: '高潮', ending: '结尾' }
 const hasNarrative = computed(() => Object.values(job.value?.summary?.narrative_structure || {}).some(Boolean))
+const commentIdeas = computed(() => normalizeCommentIdeas(job.value?.summary?.comment_ideas))
+const commentIdeasEmptyText = computed(() => Array.isArray(job.value?.summary?.comment_ideas)
+  ? '这份总结未提供适合的评论灵感，可点击下方「重新总结」再试。'
+  : '这份总结尚未包含神评论灵感，可点击下方「重新总结」生成。')
 const unwrap = (response: any) => {
   if (!response?.success) throw new Error(response?.message || '请求失败')
   return response.data
@@ -222,8 +241,13 @@ const cancel = async () => {
 const copyText = async () => {
   const summary = job.value?.summary
   if (!summary) return
-  const text = [summary.title, summary.one_sentence, summary.overview, ...summary.key_points].filter(Boolean).join('\n\n')
+  const comments = commentIdeasForCopy(commentIdeas.value)
+  const text = [summary.title, summary.one_sentence, summary.overview, ...summary.key_points, comments].filter(Boolean).join('\n\n')
   try { await navigator.clipboard.writeText(text); ElMessage.success('总结已复制') }
+  catch { ElMessage.error('复制失败') }
+}
+const copyComment = async (text: string) => {
+  try { await navigator.clipboard.writeText(text); ElMessage.success('评论已复制') }
   catch { ElMessage.error('复制失败') }
 }
 const exportFile = (format: 'md' | 'json') => {
@@ -235,5 +259,12 @@ onBeforeUnmount(stopPolling)
 
 <style scoped>
 .summary-confirm,.summary-state { min-height: 180px; display: grid; place-content: center; justify-items: center; gap: 14px; text-align: center; }.summary-state { color: var(--color-text-muted); }.summary-state .el-icon { font-size: 28px; color: var(--color-accent); }.summary-state strong,.summary-result h3 { color: var(--color-ink); }.summary-state p,.summary-error p { margin: 0; color: var(--color-text-muted); font-size: 13px; }.summary-progress { padding: 18px; border: 1px solid var(--color-line); border-radius: 0; background: var(--color-surface); }.progress-line { display: flex; justify-content: space-between; margin-bottom: 12px; }.progress-line span { font: 700 13px var(--font-mono); }.summary-progress p { margin: 12px 0 0; color: var(--color-text-muted); font-size: 12px; }.summary-tabs { margin-top: 16px; }.summary-one-sentence { margin: 8px 0 14px; color: var(--color-ink-soft); font-weight: 700; }.summary-overview { white-space: pre-wrap; line-height: 1.8; }.summary-list { margin: 0; padding-left: 20px; color: var(--color-ink-soft); line-height: 1.8; }.summary-list + .summary-list { margin-top: 14px; } .timeline-list li { margin-bottom: 10px; }.timeline-list li span { display: block; margin-top: 2px; }.summary-definition-list { display: grid; grid-template-columns: 110px 1fr; gap: 8px 14px; margin: 0; line-height: 1.7; }.summary-definition-list dt { color: var(--color-text-muted); font-size: 12px; }.summary-definition-list dd { margin: 0; color: var(--color-ink-soft); white-space: pre-wrap; }.summary-result h4 { margin: 16px 0 6px; color: var(--color-ink); }.empty-summary { color: var(--color-text-muted); }.summary-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 16px; }.summary-actions .el-button { min-height: 40px; }.summary-error { display: grid; gap: 14px; }.summary-error .el-button { justify-self: end; }
+.comment-intro { margin: 0 0 16px; color: var(--color-text-muted); font-size: 12px; line-height: 1.7; }
+.comment-ideas { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.comment-idea { padding: 14px 18px 18px; border: 1px solid var(--color-line); border-left: 3px solid var(--color-accent); background: var(--color-surface); }
+.comment-idea-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.comment-style { color: var(--color-accent); font-size: 11px; font-weight: 700; letter-spacing: .06em; }
+.comment-idea-header .el-button { min-height: 36px; margin: -6px -10px -6px 0; color: var(--color-text-muted); }
+.comment-idea p { margin: 10px 0 0; color: var(--color-ink); font-size: 16px; font-weight: 600; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 560px) { .summary-actions { display: grid; grid-template-columns: 1fr 1fr; }.summary-actions .el-button,.summary-error .el-button { width: 100%; margin: 0; } }
 </style>
