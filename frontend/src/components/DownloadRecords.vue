@@ -172,6 +172,8 @@
               <p v-if="row.status === 'downloading' && row.progress?.current_video_name" class="gallery-progress-message" role="status">{{ row.progress.current_video_name }}</p>
               <p v-if="row.status === 'failed' && row.error?.action" class="gallery-progress-message">{{ row.error.action }}</p>
               <div class="gallery-actions">
+                <el-button v-if="row.type === 'single'" size="small" @click="openContentReader({ task_id: row.id, aweme_id: row.video_info?.aweme_id })">阅读与收藏</el-button>
+                <el-button v-if="row.type === 'single' && row.video_info?.aweme_id" size="small" @click="addToTopic({ aweme_id: row.video_info.aweme_id })">加入专题</el-button>
                 <el-button v-if="row.type === 'single' && !row.is_batch_video" size="small" @click="openAssignAuthor([row])">归到作者</el-button>
                 <el-button v-if="row.status === 'failed'" size="small" type="primary" @click="handleRetry(row.parent_task_id || row.id)"><el-icon><RefreshRight /></el-icon>重试失败项</el-button>
                 <el-button v-if="(row.status === 'pending' || row.status === 'downloading') && !row.is_batch_video" size="small" @click="handleCancel(row.id)"><el-icon><Close /></el-icon>取消</el-button>
@@ -457,6 +459,8 @@
         </div>
         <dl class="task-facts"><div><dt>创建时间</dt><dd>{{ formatTime(row.created_at) }}</dd></div></dl>
         <footer class="task-card-actions">
+          <el-button v-if="row.type === 'single'" size="small" @click="openContentReader({ task_id: row.id, aweme_id: row.video_info?.aweme_id })">阅读与收藏</el-button>
+          <el-button v-if="row.type === 'single' && row.video_info?.aweme_id" size="small" @click="addToTopic({ aweme_id: row.video_info.aweme_id })">加入专题</el-button>
           <el-button v-if="row.type === 'single' && !row.is_batch_video" size="small" @click="openAssignAuthor([row])">归到作者</el-button>
           <el-button v-if="row.status === 'failed'" size="small" @click="handleRetry(row.parent_task_id || row.id)"><el-icon aria-hidden="true"><RefreshRight /></el-icon>重试失败项</el-button>
           <el-button v-if="(row.status === 'pending' || row.status === 'downloading') && !row.is_batch_video" size="small" type="warning" @click="handleCancel(row.id)"><el-icon aria-hidden="true"><Close /></el-icon>取消</el-button>
@@ -584,6 +588,7 @@ import { douyinApi } from '@/api'
 import { wsService } from '@/services/websocket'
 import TranscriptPanel from '@/components/TranscriptPanel.vue'
 import VideoSummaryPanel from '@/components/VideoSummaryPanel.vue'
+import { openContentReader, addToTopic } from '@/api/content'
 
 const store = useDownloadStore()
 // 使用storeToRefs解构响应式状态
@@ -799,14 +804,17 @@ const startAuthorSummary = async () => {
       ElMessage.warning('该作者没有已下载的单视频可总结')
       return
     }
+    let requestLimit: number | null = null
     if (preview.to_summarize > 0) {
-      await ElMessageBox.confirm(
-        `待处理 ${preview.to_summarize} 个单视频；跳过已有总结 ${preview.already_summarized} 个、正在总结 ${preview.already_running} 个。每条视频单独生成总结，不会合并成作者文档。每段模型请求最多自动重试 3 次，鉴权或请求格式错误不会重复提交。视频会发送至已配置的模型服务，可能产生费用。${preview.previous_failures ? `其中 ${preview.previous_failures} 个是上次总结失败，将重新尝试。` : ''}`,
+      const budget = await ElMessageBox.prompt(
+        `待处理 ${preview.to_summarize} 个单视频；跳过已有总结 ${preview.already_summarized} 个、正在总结 ${preview.already_running} 个。每条分别生成，视频发送至已配置模型。最少约 ${preview.to_summarize} 次新增请求；分段、合并、重试和备用通道会增加次数，真实费用取决于上游用量与单价，当前无法完整预估。填写本批累计请求上限（留空不限）；达到上限暂停后续请求，在途请求仍可能完成并计费。${preview.previous_failures ? `其中 ${preview.previous_failures} 个是上次失败，将重新尝试。` : ''}`,
         '确认逐条总结',
-        { confirmButtonText: '开始总结', cancelButtonText: '取消', type: 'warning' }
+        { confirmButtonText: '开始总结', cancelButtonText: '取消', type: 'warning', inputPlaceholder: '可选：请求次数上限', inputValidator: value => !value?.trim() || /^[1-9]\d*$/.test(value.trim()) || '请填写正整数，或留空不限' }
       )
+      if (typeof budget === 'string') return
+      requestLimit = budget.value?.trim() ? Number(budget.value) : null
     }
-    const response = await douyinApi.createAuthorSummaryBatch(author) as any
+    const response = await douyinApi.createAuthorSummaryBatch(author, requestLimit) as any
     authorBatch.value = response.data as AuthorSummaryBatch
     if (authorBatch.value.status === 'running') {
       startAuthorBatchPolling(author)
@@ -828,14 +836,17 @@ const startAuthorTranscript = async () => {
       ElMessage.warning('该作者没有已下载的单视频可提取口播')
       return
     }
+    let requestLimit: number | null = null
     if (preview.to_transcribe > 0) {
-      await ElMessageBox.confirm(
-        `待处理 ${preview.to_transcribe} 个单视频；跳过已有口播 ${preview.already_transcribed} 个、正在提取 ${preview.already_running} 个。每个视频分别生成自己的口播文案，不会合并成作者文档。语音和文案模型请求最多各自动重试 3 次；处理失败或鉴权错误仍需检查配置后重试。可能产生模型费用。${preview.previous_failures ? `其中 ${preview.previous_failures} 个是上次提取失败，将重新尝试。` : ''}`,
+      const budget = await ElMessageBox.prompt(
+        `待处理 ${preview.to_transcribe} 个单视频；跳过已有口播 ${preview.already_transcribed} 个、正在提取 ${preview.already_running} 个。每条独立保存；通常每条需要语音转写和文案整理各 1 次请求，已有检查点可减少调用，重试会增加次数。上游用量或价格缺失时费用未知。填写本批累计请求上限（留空不限）；达到上限暂停后续请求，已完成结果保留，在途请求仍可能完成并计费。${preview.previous_failures ? `其中 ${preview.previous_failures} 个是上次失败，将重新尝试。` : ''}`,
         '确认逐条提取口播',
-        { confirmButtonText: '开始提取', cancelButtonText: '取消', type: 'warning' }
+        { confirmButtonText: '开始提取', cancelButtonText: '取消', type: 'warning', inputPlaceholder: '可选：请求次数上限', inputValidator: value => !value?.trim() || /^[1-9]\d*$/.test(value.trim()) || '请填写正整数，或留空不限' }
       )
+      if (typeof budget === 'string') return
+      requestLimit = budget.value?.trim() ? Number(budget.value) : null
     }
-    const response = await douyinApi.createAuthorTranscriptBatch(author) as any
+    const response = await douyinApi.createAuthorTranscriptBatch(author, requestLimit) as any
     authorTranscriptBatch.value = response.data as AuthorTranscriptBatch
     if (authorTranscriptBatch.value.status === 'running') {
       startAuthorTranscriptBatchPolling(author)

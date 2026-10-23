@@ -138,8 +138,8 @@
 
       <div v-else-if="distillConfirm && !submitted" class="confirm-panel distill-confirm-panel">
         <header><button type="button" class="back-button" @click="distillConfirm = false"><el-icon aria-hidden="true"><ArrowLeft /></el-icon>返回修改选择</button><div><span>STEP 04 / DISTILL</span><h3>确认博主内容蒸馏</h3><p>视频分析口播与画面；图文仅提取已有正文，不下载图片。</p></div></header>
-        <div class="confirm-grid"><section><h4>本次范围</h4><strong class="confirm-count">{{ formatCount(selectedTotal) }}</strong><p>{{ selectionDescription }}</p><dl><div><dt>视频</dt><dd>{{ selectedVideoCount }}</dd></div><div><dt>图文正文</dt><dd>{{ selectedImageCount }}（逐条 0 次模型调用）</dd></div><div><dt>低信息量</dt><dd>转写后确认</dd></div><div><dt>预筛模型调用</dt><dd>约 {{ selectedVideoCount * 2 }} 次</dd></div><div><dt>完整蒸馏模型调用</dt><dd>约 {{ estimatedDistillCalls }} 次</dd></div></dl></section><section><h4>运行策略</h4><el-radio-group v-model="stagePolicy" aria-label="蒸馏档位"><el-radio-button value="full">完整蒸馏</el-radio-button><el-radio-button value="preview">先预筛</el-radio-button></el-radio-group><p>默认复用本地文件和已有成功结果；单条失败不会阻断整批。归纳模型固定为 <code>gpt-5.6-luna</code>。</p><el-checkbox v-model="forceReanalyze">强制重新分析（不覆盖历史结果）</el-checkbox><p class="distill-path">产物目录：{{ distillOutputHint }}</p></section></div>
-        <el-alert type="info" title="费用与耗时提示" description="实际耗时取决于视频数量、文件大小和模型限流；首次建议先选择 3 条。" show-icon :closable="false" />
+        <div class="confirm-grid"><section><h4>本次范围</h4><strong class="confirm-count">{{ formatCount(selectedTotal) }}</strong><p>{{ selectionDescription }}</p><dl><div><dt>视频与图文数量</dt><dd>由后台按完整选择核对</dd></div><div><dt>低信息量</dt><dd>转写后确认</dd></div><div><dt>预筛调用假设</dt><dd>每条新视频通常转写、整理各 1 次</dd></div><div><dt>完整调用次数</dt><dd>暂无法完整估算</dd></div></dl><p>上述假设未扣已有结果，归纳、分段、重试和备用通道另计；图文本身不逐条调用模型，但可能参与归纳。不会以当前页数冒充全部选择。</p></section><section><h4>运行策略</h4><el-radio-group v-model="stagePolicy" aria-label="蒸馏档位"><el-radio-button value="full">完整蒸馏</el-radio-button><el-radio-button value="preview">先预筛</el-radio-button></el-radio-group><p>默认复用本地文件和已有成功结果；单条失败不会阻断整批。归纳模型固定为 <code>gpt-5.6-luna</code>。</p><el-checkbox v-model="forceReanalyze">强制重新分析（不覆盖历史结果）</el-checkbox><label for="distill-request-limit">本批次累计模型请求上限（可留空）</label><el-input-number id="distill-request-limit" v-model="distillRequestLimit" :min="1" :precision="0" placeholder="不设上限" aria-label="蒸馏批次累计模型请求上限" /><p>分段、归纳、重试和备用通道均占次数；达到上限暂停新请求，已完成结果保留，可在批次结果调整后继续。</p><p class="distill-path">产物目录：{{ distillOutputHint }}</p></section></div>
+        <el-alert type="info" title="费用与耗时提示" description="缺少实际用量或单价时费用未知。次数上限不是金额硬上限，在途请求仍可能完成并计费；耗时还受文件大小、冷却与限流影响。" show-icon :closable="false" />
         <footer><el-button @click="distillConfirm = false">返回选择</el-button><el-button class="coral-action final-download" type="primary" :loading="distillSubmitting" @click="submitDistill">确认蒸馏 {{ formatCount(selectedTotal) }} 条作品</el-button></footer>
       </div>
 
@@ -207,6 +207,7 @@ const distillItems = ref<Array<Record<string, any>>>([])
 const distillHistory = ref<DistillRun[]>([])
 const artifactViewerOpen = ref(false)
 const forceReanalyze = ref(false)
+const distillRequestLimit = ref<number | undefined>(undefined)
 const stagePolicy = ref<'preview' | 'full'>('full')
 const previewSelected = reactive<Record<string, boolean>>({})
 const distillPollTimer = ref<ReturnType<typeof setTimeout> | null>(null)
@@ -223,13 +224,6 @@ const downloadPath = ref('')
 const selectedTotal = computed(() => selectedCount(selection.value))
 const selectedOnPage = computed(() => works.value.items.filter(item => isWorkSelected(selection.value, item)).length)
 const selectedVideoCount = computed(() => selection.value.mode === 'all_filtered' ? selectedTotal.value : works.value.items.filter(item => isSelected(item) && item.kind === 'video').length)
-const selectedImageCount = computed(() => selection.value.mode === 'all_filtered' ? 0 : works.value.items.filter(item => isSelected(item) && item.kind === 'image').length)
-const estimatedDistillCalls = computed(() => {
-  const videos = selectedVideoCount.value
-  if (!selectedTotal.value) return 0
-  const groups = Math.max(1, Math.ceil(selectedTotal.value / 8))
-  return videos * 3 + groups + (groups > 1 ? 1 : 0)
-})
 const distillProgress = computed(() => {
   if (!distillRun.value?.total_count) return 0
   return Math.min(100, Math.round(((distillRun.value.completed_count + distillRun.value.degraded_count + distillRun.value.skipped_count + distillRun.value.failed_count + (distillRun.value.cancelled_count || 0)) / distillRun.value.total_count) * 100))
@@ -384,7 +378,7 @@ const submitDistill = async () => {
       ElMessage.error(`开始蒸馏前检查未通过：缺少${missing.join('、')}。请完成配置后重试。`)
       return
     }
-    const result = await service.value.createDistill({ scanId: scan.value.scan_id, selection: toScanSelection(selection.value), forceReanalyze: forceReanalyze.value, downloadPath: downloadPath.value || undefined, stagePolicy: stagePolicy.value })
+    const result = await service.value.createDistill({ scanId: scan.value.scan_id, selection: toScanSelection(selection.value), forceReanalyze: forceReanalyze.value, downloadPath: downloadPath.value || undefined, stagePolicy: stagePolicy.value, requestLimit: distillRequestLimit.value ?? null })
     distillRun.value = result.run
     localStorage.setItem('douyin-distill-run-id', result.run_id)
     distillConfirm.value = false

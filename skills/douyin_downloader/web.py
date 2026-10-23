@@ -68,6 +68,13 @@ try:
     from .distill_service import DistillService, DistillSynthesis, DistillError, DistillMarkdown, _source_is_current, _summary_invalid_reason
     from .download_queue import PersistentDownloadQueue
     from .download_queue_api import create_download_queue_router
+    from .content_service import ContentService
+    from .content_api import create_content_router
+    from .batch_results import BatchResults
+    from .batch_results_api import create_batch_results_router
+    from .product_runtime import ProductRuntime
+    from .usage_ledger import UsageLedger, configure_default_ledger, model_request_context, current_request_context, ModelControlError
+    from .usage_api import create_usage_router
 except ImportError:
     from core import (
         DouyinDownloadSkill,
@@ -85,6 +92,13 @@ except ImportError:
     from distill_service import DistillService, DistillSynthesis, DistillError, DistillMarkdown, _source_is_current, _summary_invalid_reason
     from download_queue import PersistentDownloadQueue
     from download_queue_api import create_download_queue_router
+    from content_service import ContentService
+    from content_api import create_content_router
+    from batch_results import BatchResults
+    from batch_results_api import create_batch_results_router
+    from product_runtime import ProductRuntime
+    from usage_ledger import UsageLedger, configure_default_ledger, model_request_context, current_request_context, ModelControlError
+    from usage_api import create_usage_router
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -185,6 +199,10 @@ transcription_service = TranscriptionService()
 video_summary_service = VideoSummaryService()
 distill_service: Optional[DistillService] = None
 download_queue: Optional[PersistentDownloadQueue] = None
+content_service: Optional[ContentService] = None
+batch_results: Optional[BatchResults] = None
+usage_ledger: Optional[UsageLedger] = None
+product_runtime: Optional[ProductRuntime] = None
 
 INTERVAL_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2})\|(\d{4}-\d{2}-\d{2})$")
 MIX_ID_PATTERN = re.compile(r"^\d{5,32}$")
@@ -552,6 +570,11 @@ async def _execute_queued_download(task_id: str, aweme_id: str, auto_summary: bo
 
 
 app.include_router(create_download_queue_router(lambda: download_queue, _check_download_queue_config))
+app.include_router(create_content_router(lambda: content_service))
+app.include_router(create_usage_router(lambda: usage_ledger))
+app.include_router(create_batch_results_router(lambda: batch_results,
+    lambda kind, batch_id: product_runtime.resume(kind, batch_id),
+    lambda kind, batch_id, task_id: product_runtime.retry(kind, batch_id, task_id)))
 
 
 def _schedule_download(task_id: str, coroutine: Coroutine[Any, Any, None]) -> None:
@@ -1095,7 +1118,9 @@ async def _distill_transcribe_item(job_id: str, path: Path, progress: Any) -> Di
 async def _distill_summarize_item(job_id: str, path: Path, progress: Any) -> Dict[str, Any]:
     video_summary_service.validate_config()
     try:
-        return await video_summary_service.summarize_video(job_id, path, progress)
+        result = await video_summary_service.summarize_video(job_id, path, progress)
+        result["_time_basis"] = (result.get("_processing") or {}).get("time_basis", "unknown_segment_basis")
+        return result
     finally:
         video_summary_service._job_attempts.pop(job_id, None)
 
@@ -1103,13 +1128,22 @@ async def _distill_summarize_item(job_id: str, path: Path, progress: Any) -> Dic
 @app.on_event("startup")
 async def startup_event():
     """服务启动时初始化Skill"""
-    global skill, distill_service, download_queue
+    global skill, distill_service, download_queue, content_service, batch_results, usage_ledger, product_runtime
     skill = DouyinDownloadSkill()
     print("[DY-WEB] DouyinDownloadSkill 初始化完成")
 
     # 初始化任务管理器
     await task_manager.initialize()
     print("[DY-WEB] TaskManager 初始化完成")
+    usage_ledger = UsageLedger(task_manager.db.db_path)
+    await usage_ledger.initialize()
+    await usage_ledger.recover_after_restart()
+    configure_default_ledger(usage_ledger)
+    batch_results = BatchResults(task_manager.db.db_path, usage_ledger)
+    await batch_results.initialize()
+    product_runtime = ProductRuntime(sys.modules[__name__], batch_results, usage_ledger)
+    content_service = ContentService(task_manager.db, resolve_media=product_runtime.resolve_media, generator=product_runtime.generate_topic)
+    await content_service.initialize()
 
     # 注册WebSocket状态回调
     task_manager.register_status_callback(ws_manager.on_task_status_change)
@@ -1174,6 +1208,9 @@ async def shutdown_event():
     task_manager.unregister_status_callback(ws_manager.on_task_status_change)
     print("[DY-WEB] WebSocket状态回调已注销")
     await scan_manager.shutdown()
+    if batch_results:
+        await batch_results.close()
+    configure_default_ledger(None)
 
     # 关闭任务管理器
     await task_manager.shutdown()
@@ -1757,6 +1794,12 @@ async def config_status():
                     "api_key_configured": bool(summary_config.fallback_api_key),
                     "keychain": KEYCHAIN_STATUS.get("douyin-downloader-summary-fallback", {"status": "not_checked"}),
                 },
+                "heju": {
+                    "base_url": summary_config.heju_base_url,
+                    "model": summary_config.heju_model,
+                    "api_key_configured": bool(summary_config.heju_api_key),
+                    "keychain": KEYCHAIN_STATUS.get("douyin-downloader-summary-heju", {"status": "not_checked"}),
+                },
                 "keychain": KEYCHAIN_STATUS.get("douyin-downloader-text168", {"status": "not_checked"}),
             },
         },
@@ -2244,10 +2287,13 @@ async def _materialize_batch_video_task_reference(task_id: str) -> str:
 async def _run_transcription_job(job_id: str, task_id: str, video_path: Path) -> None:
     async def progress(stage: str, percentage: int) -> None:
         await task_manager.db.update_transcript_job(job_id, stage=stage, progress=percentage)
+        if batch_results:
+            await batch_results.observe_execution(job_id, "transcript", stage)
 
     try:
         await task_manager.db.update_transcript_job(job_id, status="running", stage="queued", progress=1)
-        result = await transcription_service.run(job_id, video_path, progress)
+        result = await transcription_service.run(job_id, video_path, progress,
+            partial_callback=lambda text: task_manager.db.update_transcript_job(job_id, original_transcript=text))
         await task_manager.db.update_transcript_job(
             job_id,
             status="completed",
@@ -2262,9 +2308,16 @@ async def _run_transcription_job(job_id: str, task_id: str, video_path: Path) ->
     except asyncio.CancelledError:
         await task_manager.db.update_transcript_job(job_id, status="cancelled", stage="cancelled", error_json=json.dumps(serialize_error(asyncio.CancelledError()), ensure_ascii=False))
         raise
+    except ModelControlError as exc:
+        await task_manager.db.update_transcript_job(job_id, status="paused", stage="budget_paused",
+            error_json=json.dumps({"code": exc.code, "reason": str(exc), "action": "在批次结果中调整调用上限后继续，已完成的转写会复用"}, ensure_ascii=False))
     except Exception as exc:
         await task_manager.db.update_transcript_job(job_id, status="failed", stage="failed", error_json=json.dumps(serialize_error(exc), ensure_ascii=False))
     finally:
+        if batch_results:
+            latest = await task_manager.db.get_transcript_job(job_id=job_id)
+            if latest:
+                await batch_results.finish_execution(job_id, "transcript", latest["status"])
         running_transcription_tasks.pop(job_id, None)
 
 
@@ -2278,6 +2331,7 @@ class SummaryCreateRequest(BaseModel):
 
 class AuthorSummaryRequest(BaseModel):
     author: str = Field(min_length=1, max_length=120)
+    request_limit: Optional[int] = Field(default=None, ge=0, le=1000000)
 
 
 class AssignAuthorRequest(AuthorSummaryRequest):
@@ -2464,13 +2518,19 @@ async def create_transcript(task_id: str, request: TranscriptCreateRequest):
         if not task:
             raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND", "message": "任务不存在"})
         existing = await task_manager.db.get_transcript_job(task_id=task_id)
-        if existing and existing["status"] in {"queued", "running"}:
+        if existing and (existing["status"] in {"queued", "running"} or (existing["status"] == "paused" and not request.force)):
+            if product_runtime:
+                await product_runtime.track(task, "transcript", existing, "shared")
             return ApiResponse(success=True, data=existing, message="口播提取正在处理中")
         if existing and existing["status"] == "completed" and (existing.get("original_transcript") or existing.get("polished_text")) and not request.force:
+            if product_runtime:
+                await product_runtime.track(task, "transcript", existing, "reused")
             return ApiResponse(success=True, data=existing, message="已返回已有口播文案")
         if not request.force:
             reused = _distill_transcript_job(await task_manager.db.get_latest_distill_result_for_task(task_id, "transcript"))
             if reused:
+                if product_runtime:
+                    await product_runtime.track(task, "transcript", reused, "reused")
                 return ApiResponse(success=True, data=reused, message="已返回已有口播文案（来自蒸馏结果）")
         video_path = await _resolve_task_video_path(task)
         transcription_service.validate_config()
@@ -2479,7 +2539,10 @@ async def create_transcript(task_id: str, request: TranscriptCreateRequest):
             await task_manager.db.update_transcript_job(job_id, status="queued", stage="queued", progress=0, original_transcript="", polished_text="", segments_json="[]", error_json=None, completed_at=None)
         else:
             await task_manager.db.create_transcript_job(job_id, task_id)
-        task_handle = asyncio.create_task(_run_transcription_job(job_id, task_id, video_path))
+        execution_id = await product_runtime.track(task, "transcript", {"job_id": job_id}, "new") if product_runtime else job_id
+        context = current_request_context()
+        with model_request_context(batch_id=context.batch_id or task_id, execution_id=execution_id, stage="transcript"):
+            task_handle = asyncio.create_task(_run_transcription_job(job_id, task_id, video_path))
         running_transcription_tasks[job_id] = task_handle
         data = await task_manager.db.get_transcript_job(job_id)
         return ApiResponse(success=True, data=data, message="口播提取已加入处理队列")
@@ -2561,6 +2624,8 @@ async def export_transcript(job_id: str, format: str = Query("txt", pattern="^(t
 async def _run_video_summary_job(job_id: str, task_id: str, video_path: Path) -> None:
     async def progress(stage: str, percentage: int) -> None:
         await task_manager.db.update_video_summary_job(job_id, stage=stage, progress=percentage)
+        if batch_results:
+            await batch_results.observe_execution(job_id, "summary", stage)
 
     async def prepared(info: Any) -> None:
         await task_manager.db.update_video_summary_job(job_id, prepared_bytes=info.prepared_bytes, processing_mode=info.mode, segment_count=info.segment_count)
@@ -2569,6 +2634,7 @@ async def _run_video_summary_job(job_id: str, task_id: str, video_path: Path) ->
         await task_manager.db.update_video_summary_job(job_id, status="running", stage="queued", progress=1)
         result = await video_summary_service.summarize_video(job_id, video_path, progress, prepared)
         processing = result.pop("_processing", None) or {}
+        result["_time_basis"] = processing.get("time_basis", "model_estimate")
         await task_manager.db.update_video_summary_job(
             job_id,
             status="completed",
@@ -2592,6 +2658,10 @@ async def _run_video_summary_job(job_id: str, task_id: str, video_path: Path) ->
             error_json=json.dumps(serialize_summary_error(asyncio.CancelledError()), ensure_ascii=False),
         )
         raise
+    except ModelControlError as exc:
+        await task_manager.db.update_video_summary_job(job_id, status="paused", stage="budget_paused",
+            provider_attempts_json=json.dumps(video_summary_service._job_attempts.pop(job_id, []), ensure_ascii=False),
+            error_json=json.dumps({"code": exc.code, "reason": str(exc), "action": "在批次结果中调整调用上限后继续，已完成片段会复用"}, ensure_ascii=False))
     except Exception as exc:
         await task_manager.db.update_video_summary_job(
             job_id,
@@ -2602,6 +2672,10 @@ async def _run_video_summary_job(job_id: str, task_id: str, video_path: Path) ->
             provider_attempts_json=json.dumps(video_summary_service._job_attempts.pop(job_id, []), ensure_ascii=False),
         )
     finally:
+        if batch_results:
+            latest = await task_manager.db.get_video_summary_job(job_id=job_id)
+            if latest:
+                await batch_results.finish_execution(job_id, "summary", latest["status"])
         running_summary_tasks.pop(job_id, None)
 
 
@@ -2615,13 +2689,19 @@ async def create_video_summary(task_id: str, request: SummaryCreateRequest):
         if not task:
             raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND", "message": "任务不存在"})
         existing = await task_manager.db.get_video_summary_job(task_id=task_id)
-        if existing and existing["status"] in {"queued", "running"}:
+        if existing and (existing["status"] in {"queued", "running"} or (existing["status"] == "paused" and not request.force)):
+            if product_runtime:
+                await product_runtime.track(task, "summary", existing, "shared")
             return ApiResponse(success=True, data=existing, message="视频总结正在处理中")
         if existing and existing["status"] == "completed" and existing.get("summary") and not request.force:
+            if product_runtime:
+                await product_runtime.track(task, "summary", existing, "reused")
             return ApiResponse(success=True, data=existing, message="已返回已有视频总结")
         if not request.force:
             reused = _distill_summary_job(await task_manager.db.get_latest_distill_result_for_task(task_id, "summary"))
             if reused:
+                if product_runtime:
+                    await product_runtime.track(task, "summary", reused, "reused")
                 return ApiResponse(success=True, data=reused, message="已返回已有视频总结（来自蒸馏结果）")
         video_path = await _resolve_task_video_path(task, "视频总结")
         video_summary_service.validate_config()
@@ -2649,7 +2729,10 @@ async def create_video_summary(task_id: str, request: SummaryCreateRequest):
                 video_summary_service.config.model,
                 input_bytes,
             )
-        task_handle = asyncio.create_task(_run_video_summary_job(job_id, task_id, video_path))
+        execution_id = await product_runtime.track(task, "summary", {"job_id": job_id}, "new") if product_runtime else job_id
+        context = current_request_context()
+        with model_request_context(batch_id=context.batch_id or task_id, execution_id=execution_id, stage="summary"):
+            task_handle = asyncio.create_task(_run_video_summary_job(job_id, task_id, video_path))
         running_summary_tasks[job_id] = task_handle
         return ApiResponse(
             success=True,
@@ -2675,9 +2758,12 @@ async def _run_author_summary_batch(batch_id: str, task_ids: List[str]) -> None:
 
     async def process_video(task_id: str) -> None:
         async with slots:
+            if batch["status"] == "paused":
+                return
             batch["current_task_id"] = task_id
             try:
-                response = await create_video_summary(task_id, SummaryCreateRequest(force=False))
+                with model_request_context(batch_kind="summary", batch_id=batch_id):
+                    response = await create_video_summary(task_id, SummaryCreateRequest(force=False))
                 job = response.data or {}
                 if job.get("status") == "completed":
                     batch["reused"] += 1
@@ -2689,6 +2775,8 @@ async def _run_author_summary_batch(batch_id: str, task_ids: List[str]) -> None:
                     latest = await task_manager.db.get_video_summary_job(task_id=task_id)
                     if latest and latest["status"] == "completed":
                         batch["completed"] += 1
+                    elif latest and latest["status"] == "paused":
+                        batch["status"] = "paused"
                     else:
                         batch["failed"] += 1
             except asyncio.CancelledError:
@@ -2700,7 +2788,8 @@ async def _run_author_summary_batch(batch_id: str, task_ids: List[str]) -> None:
     workers = [asyncio.create_task(process_video(task_id)) for task_id in task_ids]
     try:
         await asyncio.gather(*workers)
-        batch["status"] = "completed"
+        if batch["status"] != "paused":
+            batch["status"] = "completed"
     except asyncio.CancelledError:
         for worker in workers:
             worker.cancel()
@@ -2709,6 +2798,8 @@ async def _run_author_summary_batch(batch_id: str, task_ids: List[str]) -> None:
         raise
     finally:
         batch["current_task_id"] = None
+        if batch_results:
+            await batch_results.set_status("summary", batch_id, batch["status"])
         running_summary_batches.pop(batch_id, None)
 
 
@@ -2716,9 +2807,12 @@ async def _run_author_transcript_batch(batch_id: str, task_ids: List[str]) -> No
     batch = transcript_batches[batch_id]
     try:
         for task_id in task_ids:
+            if batch["status"] == "paused":
+                break
             batch["current_task_id"] = task_id
             try:
-                response = await create_transcript(task_id, TranscriptCreateRequest(force=False))
+                with model_request_context(batch_kind="transcript", batch_id=batch_id):
+                    response = await create_transcript(task_id, TranscriptCreateRequest(force=False))
                 job = response.data or {}
                 if job.get("status") == "completed" and _has_transcript_content(job):
                     batch["reused"] += 1
@@ -2730,6 +2824,8 @@ async def _run_author_transcript_batch(batch_id: str, task_ids: List[str]) -> No
                     latest = await task_manager.db.get_transcript_job(task_id=task_id)
                     if latest and latest["status"] == "completed" and _has_transcript_content(latest):
                         batch["completed"] += 1
+                    elif latest and latest["status"] == "paused":
+                        batch["status"] = "paused"
                     else:
                         batch["failed"] += 1
             except asyncio.CancelledError:
@@ -2737,12 +2833,15 @@ async def _run_author_transcript_batch(batch_id: str, task_ids: List[str]) -> No
             except Exception:
                 batch["failed"] += 1
             batch["processed"] += 1
-        batch["status"] = "completed"
+        if batch["status"] != "paused":
+            batch["status"] = "completed"
     except asyncio.CancelledError:
         batch["status"] = "interrupted"
         raise
     finally:
         batch["current_task_id"] = None
+        if batch_results:
+            await batch_results.set_status("transcript", batch_id, batch["status"])
         running_transcript_batches.pop(batch_id, None)
 
 
@@ -2796,6 +2895,8 @@ async def create_author_summary_batch(request: AuthorSummaryRequest):
              "skipped_running": sum(task.summary_status == "running" for task in author_tasks),
              "current_task_id": None}
     summary_batches[batch_id] = batch
+    if product_runtime:
+        await product_runtime.register_author("summary", batch, author_tasks, task_ids, request.request_limit)
     if task_ids:
         running_summary_batches[batch_id] = asyncio.create_task(_run_author_summary_batch(batch_id, task_ids))
     message = "作者视频逐条总结已开始" if task_ids else "没有新任务：已有总结或正在总结的视频均已跳过"
@@ -2891,6 +2992,8 @@ async def create_author_transcript_batch(request: AuthorSummaryRequest):
         "current_task_id": None,
     }
     transcript_batches[batch_id] = batch
+    if product_runtime:
+        await product_runtime.register_author("transcript", batch, author_tasks, task_ids, request.request_limit)
     if task_ids:
         running_transcript_batches[batch_id] = asyncio.create_task(_run_author_transcript_batch(batch_id, task_ids))
     message = "作者视频逐条口播提取已开始" if task_ids else "没有新任务：已有口播或正在提取的视频均已跳过"
@@ -3348,6 +3451,8 @@ async def delete_task(task_id: str, delete_files: bool = False):
                 "WHERE t.type='batch_item' AND t.mix_id=? AND tv.aweme_id=?", (parent_id, aweme_id))
             for (child_id,) in children:
                 await task_manager.db.delete_task(child_id)
+                if product_runtime:
+                    await product_runtime.clear_checkpoints(child_id)
             await task_manager.db.execute("DELETE FROM task_videos WHERE task_id=? AND aweme_id=?", (parent_id, aweme_id))
             await task_manager.db.commit()
             remaining = [v for v in videos if v.aweme_id != aweme_id]
@@ -3434,6 +3539,9 @@ async def delete_task(task_id: str, delete_files: bool = False):
                     detail=f"任务记录未删除；已删除 {deleted_video_files} 个本地视频文件，请刷新记录状态",
                 )
             raise HTTPException(status_code=404, detail="任务不存在")
+
+        if product_runtime:
+            await product_runtime.clear_checkpoints(task_id)
 
         if delete_files:
             message = (
@@ -4091,6 +4199,7 @@ class DistillRunCreateRequest(BaseModel):
     save_path: Optional[str] = None
     force_reanalyze: bool = False
     stage_policy: Literal["preview", "full"] = "full"
+    request_limit: Optional[int] = Field(default=None, ge=0, le=1000000)
 
 
 class DistillResumeRequest(BaseModel):
@@ -4207,12 +4316,16 @@ async def create_distill_run(request: DistillRunCreateRequest, x_scan_token: str
                         item.update(summary_job_id=summary["job_id"], summary=summary.get("summary"), summary_status="reused")
             items_for_db.append(item)
         await task_manager.db.add_distill_items(run_id, items_for_db)
+        if usage_ledger:
+            await usage_ledger.set_limit("distill", run_id, request.request_limit)
         distill_service.schedule(run_id)
         data = await task_manager.db.get_distill_run(run_id)
         video_count = sum(1 for item in selected if item["kind"] == "video")
-        group_count = max(1, (video_count + 7) // 8) if video_count else 0
-        estimated_model_calls = video_count * 3 + group_count + (1 if group_count > 1 else 0)
-        return ApiResponse(success=True, data={"run": data, "run_id": run_id, "selection_count": len(selected), "video_count": video_count, "image_text_count": sum(1 for item in selected if item["kind"] == "image"), "estimated_model_calls": estimated_model_calls, "save_path": resolved_save_path}, message="博主内容蒸馏已加入队列")
+        # 归纳分组按实际文本长度决定；启动前不虚构精确总调用数。
+        minimum_calls = sum(2 for item in items_for_db if item["metadata"]["kind"] == "video" and item.get("transcript_status") != "reused")
+        minimum_calls += sum(1 for item in items_for_db if item["metadata"]["kind"] == "video" and item.get("summary_status") != "reused")
+        return ApiResponse(success=True, data={"run": data, "run_id": run_id, "selection_count": len(selected), "video_count": video_count, "image_text_count": sum(1 for item in selected if item["kind"] == "image"), "estimated_model_calls": None, "minimum_model_calls": minimum_calls,
+            "estimate_note": "按未复用口播每条转写与整理各一次、总结至少一次估算下限；长视频分段、归纳、重试与备用通道另计，实际金额未知", "save_path": resolved_save_path}, message="博主内容蒸馏已加入队列")
     except ScanAccessError as exc:
         raise HTTPException(status_code=exc.status_code, detail={"code": exc.code, "message": exc.message}) from exc
 

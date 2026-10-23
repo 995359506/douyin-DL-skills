@@ -154,8 +154,8 @@ export const douyinApi = {
   createVideoSummary: (taskId: string, force = false) =>
     api.post(`/tasks/${taskId}/summary`, { force }),
 
-  createAuthorSummaryBatch: (author: string) =>
-    api.post('/summary-batches', { author }),
+  createAuthorSummaryBatch: (author: string, requestLimit: number | null = null) =>
+    api.post('/summary-batches', { author, request_limit: requestLimit }),
 
   previewAuthorSummaryBatch: (author: string) =>
     api.post('/summary-batches/preview', { author }),
@@ -163,8 +163,8 @@ export const douyinApi = {
   getAuthorSummaryBatch: (author: string) =>
     api.get('/summary-batches', { params: { author } }),
 
-  createAuthorTranscriptBatch: (author: string) =>
-    api.post('/transcript-batches', { author }),
+  createAuthorTranscriptBatch: (author: string, requestLimit: number | null = null) =>
+    api.post('/transcript-batches', { author, request_limit: requestLimit }),
 
   previewAuthorTranscriptBatch: (author: string) =>
     api.post('/transcript-batches/preview', { author }),

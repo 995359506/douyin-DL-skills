@@ -1,7 +1,7 @@
 """主页批量链接入队与进度接口，不在提交阶段请求抖音。"""
 
 import re
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -16,6 +16,7 @@ class DownloadBatchRequest(BaseModel):
     profile_id: str = Field(default="", max_length=256, pattern=r"^[\w-]*$")
     client_request_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     auto_summary: bool = True
+    request_limit: Optional[int] = Field(default=None, ge=0, le=1000000)
 
     @field_validator("video_ids")
     @classmethod
@@ -54,6 +55,7 @@ def create_download_queue_router(
             batch = await queue.create(
                 request.video_ids, author=request.author, profile_id=request.profile_id,
                 client_request_id=request.client_request_id, auto_summary=request.auto_summary,
+                request_limit=request.request_limit,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail={"code": "DOWNLOAD_BATCH_REQUEST_CONFLICT", "message": "同一提交编号已用于其他内容，请重新收集并确认", "action": "不要修改待重试批次的链接或提交编号"}) from exc

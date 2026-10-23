@@ -35,6 +35,47 @@
 旧版 1.1.0 尚未提交的浏览器队列不会自动迁移，请核对看板后重新收集。下载间隔只能降低请求频率，
 不能保证避免平台风控；遇到验证码或限制应停止并处理。
 
+## iPhone：分享链接到电脑看板
+
+手机访问服务器上的 `/douyin-inbox/`，填写收件口令并粘贴单条抖音视频的分享内容。
+也可以安装私人快捷指令：在抖音中复制链接后运行“发送到抖音看板”，或从系统分享菜单运行。
+快捷指令显示“服务器已收下”只表示链接已保存，实际下载和总结状态可在手机收件页刷新查看。
+
+服务器只保存规范化视频链接、回执和固定状态，不接收抖音 Cookie、模型密钥、视频或总结正文。
+电脑每 10 秒主动取件，先在本机落盘再确认；提交与入队均按请求编号去重。
+下载复用现有后台队列，已下载自动跳过，实际下载结束后间隔 30 秒；每条下载完成后独立总结，已有结果复用。
+**关闭手机页面不会停止任务。电脑断网、关机或休眠期间，服务器暂存链接，电脑恢复联网后继续处理。**
+
+服务端使用 Python 标准库，可直接运行 `skills/douyin_downloader/mobile_inbox.py`，
+参数为 `--db <持久化数据库> --page <mobile-inbox.html> --port 8025`。
+只绑定 `127.0.0.1`，由已有 Nginx 将 `/douyin-inbox/` 转发至回环端口；可使用 HTTP + IP。
+收件页面来自 `frontend/public/mobile-inbox.html`，构建后复制 `frontend/dist/mobile-inbox.html`。
+代理须保留路径尾部斜杠，设置请求大小上限 16 KB、访问频率限制，并关闭该路径的访问日志。
+
+服务器设置两个不同的随机口令（至少 20 字符）：`DOUYIN_INBOX_SUBMIT_TOKEN` 供手机提交，
+`DOUYIN_INBOX_WORKER_TOKEN` 只供电脑取件；环境文件权限 `0600`，数据库目录权限 `0700`。
+电脑独立运行 `.venv/bin/python -m skills.douyin_downloader.mobile_inbox_worker`，设置：
+
+| 环境变量 | 用途 |
+| --- | --- |
+| `DOUYIN_INBOX_URL` | 含 `/douyin-inbox/` 的服务器地址 |
+| `DOUYIN_INBOX_WORKER_TOKEN` | 取件口令，与手机收件口令不同 |
+| `DOUYIN_INBOX_MAIN_DB` | 现有看板数据库的绝对路径，仅查询状态 |
+| `DOUYIN_INBOX_STATE_DIR` | 本地回执目录，默认在用户 Library/Application Support 下 |
+
+可用单独的 LaunchAgent 保持取件进程运行，无需重启看板或打断现有总结。
+重启时本地回执和队列继续复用；先保留两个数据库，再重启对应进程。不要删除回执数据库来重试。
+登录或配置未就绪时链接会保留，手机显示处理提示，修复电脑配置后自动重试。
+
+`scripts/build_mobile_shortcut.py --server <收件地址> --output <私人目录/发送到抖音看板.shortcut>`
+从 `DOUYIN_INBOX_SUBMIT_TOKEN` 读取口令生成快捷指令，再通过 macOS `shortcuts sign` 签名。
+签名产物含手机收件口令，只放个人 iCloud 云盘或其他私人目录，不提交仓库，也不公开提供下载。
+iPhone 首次安装、首次网络授权和抖音分享菜单显示情况需要在真机确认；也可直接使用手机网页提交。
+若旧版提示“找不到操作”或很快结束且没有提示，请重新导入最新版并替换旧指令；
+更新 iCloud 文件不会自动替换手机中已经安装的快捷指令。新版使用动作输出直接传递分享内容和提交编号，
+避免命名变量的输入包装不兼容导致空请求；服务器反馈会直接显示，空剪贴板会提示先复制链接。
+手机页面仅显示提交和处理状态，视频播放与逐条总结仍在电脑看板中查看。
+
 ## 口播文案提取
 
 任务工作台中的已完成单视频可使用“提取口播”生成原始转写和整理后的口播文案；作者画廊也支持逐条批量提取，已有口播和正在处理的视频会跳过。处理只读取下载目录中的本地视频，不会重新下载媒体。语音转写与文案整理阶段遇到网络中断、限流、上游错误或无效响应时，每个模型请求最多自动重试 3 次；鉴权和请求格式错误不会盲目重试。
@@ -59,7 +100,7 @@ DOUYIN_DASHSCOPE_API_KEY=your-dashscope-key
 
 任务工作台中的已完成单视频可使用“视频总结”。小视频直接发送完整视频；超过安全请求大小时，服务会在本机用 `ffmpeg` 生成临时压缩副本，仍发送完整画面和音频，原始下载文件不会修改。压缩后仍无法达到大小目标时，会按连续时间片分析并自动合并结果。临时文件在任务结束、失败或取消后清理。
 
-视频总结优先使用 aigateway 的 Gemini 兼容接口，再尝试 text168，最后使用 2.5 Flash 保底。新网关 Key 存在 macOS Keychain 的 `douyin-downloader-summary-aigateway`，不写入配置文件。
+视频总结依次使用 aigateway、text168、原 2.5 Flash 备用接口，最后才尝试 heju 的 3.8 Flash；未配置密钥的通道不启用。aigateway Key 存在 macOS Keychain 的 `douyin-downloader-summary-aigateway`，heju Key 单独存为 `douyin-downloader-summary-heju`，不写入配置文件。
 
 单视频下载确认时默认勾选“下载完成后自动生成视频总结”；下载成功后后台创建总结任务，已有结果会复用，总结失败不改变下载完成状态。工作台原有合集和主页扫描下载不会自动触发逐条模型调用；油猴“后台下载队列”经确认后会为每条下载成功的视频自动总结。
 
@@ -73,6 +114,9 @@ DOUYIN_VIDEO_SUMMARY_MODEL=gemini-3.7-flash
 # 可选备用接口（默认地址已内置，也可显式覆盖）
 DOUYIN_VIDEO_SUMMARY_FALLBACK_BASE_URL=https://ai.image.mohuajz.eu.org/v1beta
 DOUYIN_VIDEO_SUMMARY_FALLBACK_MODEL=gemini-2.5-flash
+# 最低优先级备用接口（使用原生 Gemini 视频接口，不是 /v1 文本接口）
+DOUYIN_VIDEO_SUMMARY_HEJU_BASE_URL=https://www.hejuapi.com/v1beta
+DOUYIN_VIDEO_SUMMARY_HEJU_MODEL=gemini-3.8-flash
 DOUYIN_VIDEO_SUMMARY_MAX_BYTES=8388608
 DOUYIN_VIDEO_SUMMARY_SEGMENT_BYTES=8388608
 DOUYIN_VIDEO_SUMMARY_TIMEOUT_SECONDS=600
@@ -81,6 +125,8 @@ DOUYIN_VIDEO_SUMMARY_REQUEST_RETRIES=3
 ```
 
 主 API Key 使用 macOS Keychain 的 `douyin-downloader-text168` 项保存，备用 API Key 使用 `douyin-downloader-summary-fallback` 项保存；不写入前端、数据库或日志。主接口遇到鉴权、限流、上游错误或连接失败时，当前作业会自动切换备用接口。处理阶段和原始/发送大小会显示在视频总结结果中。
+
+heju 也可通过 `DOUYIN_VIDEO_SUMMARY_HEJU_API_KEY` 环境变量配置，优先于其 Keychain 项。新增备用通道不会改变已有三条通道的顺序；同一作业内成功通道的粘滞策略保持不变。粘滞索引仅在内存中，服务重启后新请求重新从最高优先级通道尝试。`/api/config/status` 和 `/api/ai/diagnostics` 提供 heju 的脱敏启用状态，不返回密钥。
 
 作者画廊的“一键视频总结”与“一键提取口播”始终按单视频处理，不合并为作者文档；已有成功结果与运行中的作业会跳过。模型请求级自动重试有次数上限，鉴权、格式错误、缺失本地文件等确定性错误仍需修复配置或文件后再试。
 
@@ -299,7 +345,7 @@ cd frontend && npm run dev
 
 说明：Vite 开发服务器（默认 `127.0.0.1:5173`）只用于调试，不能作为交付入口。
 本项目唯一正式页面是 `http://127.0.0.1:8080/app/`；所有前端改动必须在主目录
-项目主目录构建后，通过该地址验收。
+`/Users/example/Documents/ChatGPT/agent专家/douyin-DL-skills` 构建后，通过该地址验收。
 不要使用 3001 或其他 worktree 页面作为项目版本，避免出现“改了前端但 8080 不生效”的分叉。
 
 ---

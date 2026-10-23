@@ -14,14 +14,16 @@ import tempfile
 from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
 try:
     from .transcription_service import _keychain_secret
+    from .usage_ledger import ModelControlError, UsageLedger, content_hash, file_content_hash, get_default_ledger, recorded_post
 except ImportError:
     from transcription_service import _keychain_secret
+    from usage_ledger import ModelControlError, UsageLedger, content_hash, file_content_hash, get_default_ledger, recorded_post
 
 
 ProgressCallback = Callable[[str, int], Awaitable[None]]
@@ -70,6 +72,9 @@ class SummaryConfig:
     fallback_base_url: str = "https://ai.image.mohuajz.eu.org/v1beta"
     fallback_api_key: str = ""
     fallback_model: str = "gemini-2.5-flash"
+    heju_base_url: str = "https://www.hejuapi.com/v1beta"
+    heju_api_key: str = ""
+    heju_model: str = "gemini-3.8-flash"
     timeout_seconds: float = 600.0
     request_retries: int = 3
     retry_backoff_seconds: float = 1.0
@@ -96,6 +101,9 @@ class SummaryConfig:
         fallback_api_key = os.getenv("DOUYIN_VIDEO_SUMMARY_FALLBACK_API_KEY", "").strip()
         if not fallback_api_key:
             fallback_api_key = _keychain_secret("douyin-downloader-summary-fallback")
+        heju_api_key = os.getenv("DOUYIN_VIDEO_SUMMARY_HEJU_API_KEY", "").strip()
+        if not heju_api_key:
+            heju_api_key = _keychain_secret("douyin-downloader-summary-heju")
         return cls(
             gateway_base_url=os.getenv("DOUYIN_VIDEO_SUMMARY_GATEWAY_BASE_URL", "https://api.aigateway.online/v1beta").strip().rstrip("/"),
             gateway_api_key=gateway_api_key,
@@ -106,6 +114,9 @@ class SummaryConfig:
             fallback_base_url=os.getenv("DOUYIN_VIDEO_SUMMARY_FALLBACK_BASE_URL", "https://ai.image.mohuajz.eu.org/v1beta").strip().rstrip("/"),
             fallback_api_key=fallback_api_key,
             fallback_model=os.getenv("DOUYIN_VIDEO_SUMMARY_FALLBACK_MODEL", "gemini-2.5-flash").strip(),
+            heju_base_url=os.getenv("DOUYIN_VIDEO_SUMMARY_HEJU_BASE_URL", "https://www.hejuapi.com/v1beta").strip().rstrip("/"),
+            heju_api_key=heju_api_key,
+            heju_model=os.getenv("DOUYIN_VIDEO_SUMMARY_HEJU_MODEL", "gemini-3.8-flash").strip(),
             timeout_seconds=float(os.getenv("DOUYIN_VIDEO_SUMMARY_TIMEOUT_SECONDS", "600")),
             request_retries=max(0, int(os.getenv("DOUYIN_VIDEO_SUMMARY_REQUEST_RETRIES", "3"))),
             retry_backoff_seconds=max(0.0, float(os.getenv("DOUYIN_VIDEO_SUMMARY_RETRY_BACKOFF_SECONDS", "1"))),
@@ -135,6 +146,9 @@ class VideoPreparation:
     prepared_paths: list[Path]
     original_bytes: int
     prepared_bytes: int
+    # 使用原片切分起点，不能累加转码后实测时长，否则长视频会逐段偏移。
+    segment_starts: tuple[float, ...] = ()
+    segment_durations: tuple[float, ...] = ()
 
     @property
     def segment_count(self) -> int:
@@ -186,14 +200,18 @@ def _error(stage: str, code: str, reason: str, action: str) -> Dict[str, str]:
 
 class VideoSummaryService:
     VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
-    TRUSTED_HOSTS = {"api.aigateway.online", "ai.image.mohuajz.eu.org", "api.text168.com", "localhost", "127.0.0.1"}
+    TRUSTED_HOSTS = {"api.aigateway.online", "ai.image.mohuajz.eu.org", "api.text168.com", "www.hejuapi.com", "localhost", "127.0.0.1"}
 
-    def __init__(self, config: Optional[SummaryConfig] = None):
+    def __init__(self, config: Optional[SummaryConfig] = None, ledger: Optional[UsageLedger] = None):
         self.config = config or SummaryConfig.from_environment()
+        self.ledger = ledger
         self._cancel_events: Dict[str, asyncio.Event] = {}
         self._job_provider_indexes: Dict[str, int] = {}
         self._job_attempts: Dict[str, list[Dict[str, Any]]] = {}
         self._job_segment_indexes: Dict[str, int] = {}
+        self._job_parse_retry_indexes: Dict[str, int] = {}
+        self._job_fallback_indexes: Dict[str, bool] = {}
+        self._job_input_hashes: Dict[str, str] = {}
         self._concurrency = asyncio.Semaphore(5)
 
     def validate_config(self) -> None:
@@ -215,6 +233,8 @@ class VideoSummaryService:
             providers.append({"name": "primary", "base_url": self.config.base_url, "api_key": self.config.api_key, "model": self.config.model})
         if self.config.fallback_base_url and self.config.fallback_api_key:
             providers.append({"name": "fallback", "base_url": self.config.fallback_base_url, "api_key": self.config.fallback_api_key, "model": self.config.fallback_model})
+        if self.config.heju_base_url and self.config.heju_api_key:
+            providers.append({"name": "heju", "base_url": self.config.heju_base_url, "api_key": self.config.heju_api_key, "model": self.config.heju_model})
         return providers
 
     def _validate_provider(self, provider: Dict[str, str]) -> None:
@@ -418,6 +438,8 @@ class VideoSummaryService:
         count = max(2, min(self.config.max_segments, math.ceil(input_path.stat().st_size / self.config.segment_bytes)))
         segment_duration = probe.duration_seconds / count
         paths: list[Path] = []
+        starts: list[float] = []
+        durations: list[float] = []
         for index in range(count):
             self._check_cancelled(job_id)
             start = index * segment_duration
@@ -436,8 +458,10 @@ class VideoSummaryService:
             if not output.exists():
                 raise SummaryPreparationError("SUMMARY_SEGMENT_TOO_LARGE", f"第 {index + 1} 段视频无法压缩到安全大小", "缩短视频或降低原视频清晰度后重试")
             paths.append(output)
+            starts.append(start)
+            durations.append(duration)
             await self._update(callback, "compressing_segments", 15 + int((index + 1) / count * 25))
-        return VideoPreparation("chunked", input_path, paths, input_path.stat().st_size, sum(item.stat().st_size for item in paths))
+        return VideoPreparation("chunked", input_path, paths, input_path.stat().st_size, sum(item.stat().st_size for item in paths), tuple(starts), tuple(durations))
 
     async def _prepare_video(self, job_id: str, video_path: Path, temp_dir: Path, callback: Optional[ProgressCallback]) -> VideoPreparation:
         self._validate_video(video_path)
@@ -461,7 +485,7 @@ class VideoSummaryService:
         return await self._prepare_segments(job_id, video_path, probe, temp_dir, callback)
 
     def _summary_prompt(self, segment_offset: float = 0.0, segment_count: int = 1) -> str:
-        prefix = "这是完整视频。" if segment_count == 1 else f"这是完整视频从第 {segment_offset:.1f} 秒开始的一段连续片段，共 {segment_count} 段之一。请把时间写成原视频绝对秒数。"
+        prefix = "这是完整视频，时间使用从零开始的全片秒数。" if segment_count == 1 else f"这是完整视频的连续片段，共 {segment_count} 段之一。时间必须写为本片段从零开始的相对秒数，系统会换算到原片，禁止自行添加偏移。"
         return (
             prefix + "请做一份有细节、可复核、适合内容研究的中文视频分析，不要只写泛泛的摘要。"
             "按视频实际顺序覆盖开场、发展、转折/冲突、高潮、结尾；说明人物做了什么、画面如何变化、"
@@ -470,7 +494,7 @@ class VideoSummaryService:
             "title（准确标题）、one_sentence（一句话概括）、overview（至少 3 段；在信息足够时不少于 180 个中文字符，"
             "按起因-经过-结果完整叙述）、"
             "key_points（6-10 条具体事实或观点，每条说明主体和动作/结果）、"
-            "timeline（6-12 条；每条包含原视频绝对秒数 time、画面 visual、动作 action、口播/声音 audio、意义 significance；"
+            "timeline（6-12 条；每条包含从当前输入视频起点计算的秒数 time、画面 visual、动作 action、口播/声音 audio、意义 significance；"
             "若片段信息不足则按实际数量返回）、"
             "visual_content（6-12 条具体画面变化，包含景别/人物/物品/环境/动作等可观察细节）、"
             "spoken_content（按顺序记录听到的完整口播、对白、字幕或声音；听不清则标注）、"
@@ -513,6 +537,8 @@ class VideoSummaryService:
         ordered = providers[preferred:] + providers[:preferred]
         last_error: Optional[BaseException] = None
         for provider_index, provider in enumerate(ordered):
+            actual_index = (preferred + provider_index) % len(providers)
+            self._job_fallback_indexes[job_id] = actual_index > 0 or provider_index > 0
             attempt_info = {"provider": provider["name"], "model": provider["model"], "host": urlparse(provider["base_url"]).hostname}
             if job_id in self._job_segment_indexes:
                 attempt_info["segment_index"] = self._job_segment_indexes[job_id]
@@ -521,14 +547,13 @@ class VideoSummaryService:
                     job_id, provider, payload, timeout,
                 )
                 self._job_attempts.setdefault(job_id, []).append({**attempt_info, "status": 200})
-                actual_index = (preferred + provider_index) % len(providers)
                 self._job_provider_indexes[job_id] = actual_index
                 return response
             except (SummaryModelError, SummaryTransportError) as exc:
                 attempts = self._job_attempts.setdefault(job_id, [])
                 attempts.append({**attempt_info, "status": getattr(exc, "status_code", None)})
                 if isinstance(exc, SummaryModelError):
-                    exc.fallback_configured = any(item["name"] == "fallback" for item in providers)
+                    exc.fallback_configured = any(item["name"] in {"fallback", "heju"} for item in providers)
                     exc.attempts = list(attempts)
                 last_error = exc
                 if provider_index + 1 < len(ordered):
@@ -548,9 +573,15 @@ class VideoSummaryService:
         for attempt in range(self.config.request_retries + 1):
             self._check_cancelled(job_id)
             try:
-                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-                    response = await client.post(
-                        request_url,
+                # 禁止自动重定向 POST，防止绕过每次发包的占额与记账边界。
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+                    response = await recorded_post(
+                        client, request_url, ledger=self.ledger, execution_id=job_id,
+                        stage="summary_segment" if job_id in self._job_segment_indexes else "summary_merge" if not any("inlineData" in part for content in payload.get("contents", []) for part in content.get("parts", [])) else "summary",
+                        segment_index=self._job_segment_indexes.get(job_id),
+                        provider=provider["name"], model=provider["model"],
+                        retry_index=attempt + self._job_parse_retry_indexes.get(job_id, 0),
+                        is_fallback=self._job_fallback_indexes.get(job_id, False),
                         headers={"x-goog-api-key": provider["api_key"], "Content-Type": "application/json"},
                         json=payload,
                     )
@@ -561,7 +592,7 @@ class VideoSummaryService:
                     raise SummaryTransportError(detail, provider["model"], provider["name"], urlparse(provider["base_url"]).hostname or "") from exc
                 await asyncio.sleep(self.config.retry_backoff_seconds * (2**attempt))
                 continue
-            if response.status_code < 400:
+            if 200 <= response.status_code < 300:
                 break
             try:
                 body = response.json()
@@ -590,33 +621,48 @@ class VideoSummaryService:
 
     async def _summarize_segments(self, job_id: str, preparation: VideoPreparation, callback: Optional[ProgressCallback]) -> Dict[str, Any]:
         summaries: List[Dict[str, Any]] = []
-        offset = 0.0
+        ledger = self.ledger or get_default_ledger()
         for index, path in enumerate(preparation.prepared_paths):
             self._check_cancelled(job_id)
             await self._update(callback, "analyzing_segments", 45 + int(index / max(preparation.segment_count, 1) * 35))
             self._job_segment_indexes[job_id] = index + 1
+            # 历史或第三方构造没有原片切分边界时保持文字可读，但不伪装精确跳转。
+            known_offset = len(preparation.segment_starts) == preparation.segment_count
+            offset = preparation.segment_starts[index] if known_offset else 0.0
+            duration = preparation.segment_durations[index] if len(preparation.segment_durations) == preparation.segment_count else None
+            fingerprint = content_hash({"input": self._job_input_hashes.get(job_id) or await file_content_hash(path), "index": index, "start": offset if known_offset else None, "duration": duration, "providers": [(p["name"], p["model"], p["base_url"]) for p in self._providers()], "version": 2}) if ledger else ""
             try:
-                summary = await self._generate_parsed(job_id, path, self._summary_prompt(offset, preparation.segment_count))
+                summary = await ledger.get_checkpoint(job_id, f"summary_segment:{index}", fingerprint) if ledger else None
+                if summary is None:
+                    summary = await self._generate_parsed(job_id, path, self._summary_prompt(offset, preparation.segment_count))
+                    summary["timeline"] = _map_segment_timeline(summary.get("timeline"), offset, duration, known_offset)
+                    if ledger:
+                        await ledger.save_checkpoint(job_id, f"summary_segment:{index}", fingerprint, summary)
             finally:
                 self._job_segment_indexes.pop(job_id, None)
             summaries.append(summary)
-            try:
-                offset += (await self._probe_video(path)).duration_seconds
-            except SummaryPreparationError:
-                pass
         combine_prompt = (
             "请把下面多个连续视频片段的 JSON 分析合并成一份详细、去重、按原视频时间排序的中文视频总结。"
             "保留并补全完整视频的起因-经过-结果、转折、情绪变化、镜头与声音表达；overview 写成连贯的多段文字，"
-            "timeline 合并为具体时间线，事实分析的所有结论只能来自片段内容。只返回与片段相同字段的 JSON，不要添加 Markdown。"
+            "timeline 由系统按原片切分边界合并，不得重写时间；事实分析的所有结论只能来自片段内容。只返回与片段相同字段的 JSON，不要添加 Markdown。"
             "comment_ideas 必须围绕完整视频重新整理、去重，不要直接堆叠各片段的评论。"
             + _COMMENT_IDEAS_GUIDANCE +
             "片段分析如下：\n" + json.dumps(summaries, ensure_ascii=False)
         )
         await self._update(callback, "combining_segments", 85)
-        return await self._generate_parsed(job_id, None, combine_prompt)
+        merge_hash = content_hash({"summaries": summaries, "version": 2})
+        result = await ledger.get_checkpoint(job_id, "summary_merge", merge_hash) if ledger else None
+        if result is None:
+            result = await self._generate_parsed(job_id, None, combine_prompt)
+            # 时间线只来源于已映射的片段结果，模型合并不能二次偏移或编造时间。
+            result["timeline"] = sorted([entry for summary in summaries for entry in summary.get("timeline", []) if isinstance(entry, dict)], key=lambda entry: entry.get("time_seconds") if isinstance(entry.get("time_seconds"), (int, float)) else math.inf)
+            if ledger:
+                await ledger.save_checkpoint(job_id, "summary_merge", merge_hash, result)
+        return result
 
     async def _generate_parsed(self, job_id: str, video_path: Optional[Path], prompt: str) -> Dict[str, Any]:
         for attempt in range(self.config.request_retries + 1):
+            self._job_parse_retry_indexes[job_id] = attempt
             response = await self._request_generate(job_id, video_path, prompt)
             try:
                 return _parse_summary_response(response, self.config.model)
@@ -632,6 +678,13 @@ class VideoSummaryService:
         try:
             async with self._concurrency:
                 self._check_cancelled(job_id)
+                ledger = self.ledger or get_default_ledger()
+                fingerprint = content_hash({"video": await file_content_hash(video_path), "providers": [(p["name"], p["model"], p["base_url"]) for p in self._providers()], "version": 2}) if ledger else ""
+                self._job_input_hashes[job_id] = fingerprint
+                finished = await ledger.get_checkpoint(job_id, "summary_completed", fingerprint) if ledger else None
+                if finished is not None:
+                    await self._update(callback, "completed", 100)
+                    return finished
                 with tempfile.TemporaryDirectory(prefix="douyin-summary-") as temp_dir_name:
                     preparation = await self._prepare_video(job_id, video_path, Path(temp_dir_name), callback)
                     if preparation_callback:
@@ -650,6 +703,7 @@ class VideoSummaryService:
                             if preparation_callback:
                                 await preparation_callback(segmented)
                             result = await self._summarize_segments(job_id, segmented, callback)
+                            preparation = segmented
                     active_provider = self._providers()[self._job_provider_indexes.get(job_id, 0)]
                     result["_processing"] = {
                         "mode": preparation.mode,
@@ -658,13 +712,67 @@ class VideoSummaryService:
                         "segment_count": preparation.segment_count,
                         "provider": active_provider["name"],
                         "model": active_provider["model"],
+                        "time_basis": "mapped_estimate" if preparation.mode == "chunked" and preparation.segment_starts else "model_estimate" if preparation.mode != "chunked" else "unknown_segment_basis",
                     }
+                    if preparation.mode != "chunked":
+                        result["timeline"] = _map_segment_timeline(result.get("timeline"), 0, None, True)
+                        for entry in result["timeline"]:
+                            if entry["time_seconds"] is not None:
+                                entry["time_basis"] = "model_estimate"
+                    if ledger:
+                        await ledger.save_checkpoint(job_id, "summary_completed", fingerprint, result)
                     await self._update(callback, "completed", 100)
                     return result
         finally:
             self._cancel_events.pop(job_id, None)
             self._job_provider_indexes.pop(job_id, None)
             self._job_segment_indexes.pop(job_id, None)
+            self._job_parse_retry_indexes.pop(job_id, None)
+            self._job_fallback_indexes.pop(job_id, None)
+            self._job_input_hashes.pop(job_id, None)
+
+
+def _estimated_seconds(value: Any) -> Optional[float]:
+    """仅接受明确的秒数或时分秒，不从描述文字猜时间。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+    elif isinstance(value, str):
+        text = value.strip().replace("：", ":")
+        # 区间以明确起点定位；原始区间另行保留在 time_raw。
+        text = re.split(r"\s*(?:[-–—~～]|至)\s*", text, maxsplit=1)[0]
+        if re.fullmatch(r"\d+(?:\.\d+)?", text):
+            seconds = float(text)
+        elif re.fullmatch(r"\d+:\d{1,2}(?::\d{1,2}(?:\.\d+)?)?", text):
+            parts = [float(part) for part in text.split(":")]
+            if any(part >= 60 for part in parts[1:]):
+                return None
+            seconds = sum(part * 60 ** index for index, part in enumerate(reversed(parts)))
+        else:
+            return None
+    else:
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
+def _map_segment_timeline(value: Any, offset: float, duration: Optional[float], known_offset: bool) -> list[Dict[str, Any]]:
+    """片段时间只换算一次；无法核验的时间保留文字并禁用定位。"""
+    entries = []
+    for item in value if isinstance(value, list) else []:
+        if not isinstance(item, dict):
+            continue
+        entry = dict(item)
+        raw = entry.get("time")
+        seconds = _estimated_seconds(raw)
+        usable = known_offset and seconds is not None and (duration is None or seconds <= duration)
+        entry["time_raw"] = raw
+        entry["time_seconds"] = offset + seconds if usable else None
+        entry["time_basis"] = "mapped_estimate" if usable else "unknown_segment_basis" if not known_offset else "invalid"
+        if usable:
+            entry["time"] = offset + seconds
+        entries.append(entry)
+    return entries
 
 
 def _response_text(response: Dict[str, Any]) -> str:
@@ -720,6 +828,8 @@ def _parse_summary_response(response: Dict[str, Any], model: str = "gemini-3.7-f
 
 
 def serialize_summary_error(exc: BaseException) -> Dict[str, str]:
+    if isinstance(exc, ModelControlError):
+        return _error("paused", exc.code, str(exc), "调整批次调用上限或恢复台账后，点击继续；已完成片段会复用")
     if isinstance(exc, asyncio.CancelledError):
         return _error("cancelled", "SUMMARY_CANCELLED", "视频总结已取消", "可重新点击视频总结")
     if isinstance(exc, FileNotFoundError):
@@ -733,7 +843,7 @@ def serialize_summary_error(exc: BaseException) -> Dict[str, str]:
         provider_label = f"{exc.provider or '模型通道'}（{exc.host or '未记录域名'}）HTTP {exc.status_code}"
         if not exc.fallback_configured:
             fallback_hint = "；备用接口未启用：请检查 Keychain 中 douyin-downloader-summary-fallback"
-        elif any(item.get("provider") == "fallback" and item.get("status") != 200 for item in exc.attempts):
+        elif any(item.get("provider") in {"fallback", "heju"} and item.get("status") != 200 for item in exc.attempts):
             fallback_hint = "；备用接口已尝试且失败"
         else:
             fallback_hint = "；备用接口已启用"

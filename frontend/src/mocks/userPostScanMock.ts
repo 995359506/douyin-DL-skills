@@ -85,7 +85,7 @@ export const createMockUserPostScanService = (scenario: string): UserPostScanSer
     async createDownload(_request: DownloadScanRequest) { return { task_id: 'mock-task-user-selection', message: 'Mock 下载任务已创建（未下载媒体）' } },
     async createDistill(_request) {
       mockRun = { run_id: 'mock-distill-run', status: 'queued', nickname: profile.nickname, total_count: 3, completed_count: 0, degraded_count: 0, skipped_count: 1, failed_count: 0, synthesis_model: 'gpt-5.6-luna' }
-      return { run_id: mockRun.run_id, run: mockRun, video_count: 2, image_text_count: 1, estimated_model_calls: 6 }
+      return { run_id: mockRun.run_id, run: mockRun, video_count: 2, image_text_count: 1, estimated_model_calls: null, minimum_model_calls: 0, estimate_note: '演示数据不包含真实模型调用，实际用量未知' }
     },
     async getDistill(_runId): Promise<DistillDetail> {
       if (mockRun && mockRun.status === 'queued') mockRun = { ...mockRun, status: 'completed', completed_count: 2 }

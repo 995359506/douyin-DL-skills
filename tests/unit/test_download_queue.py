@@ -261,7 +261,7 @@ async def test_pause_stop_do_not_interrupt_current_and_prevent_following(queue_f
 
 async def test_failure_pauses_and_retry_reuses_task_without_sensitive_error(queue_factory, tmp_path):
     clock, attempt, prepared = [1000.0], [0], []
-    secret = "sk-test-public-placeholder-only"
+    secret = "sk-test-only-placeholder-000000000000"
 
     async def prepare(aweme_id, *args):
         prepared.append(aweme_id)
@@ -370,7 +370,7 @@ async def test_payload_limits_align_with_api_and_summary_flag_is_visible(queue_f
 
 async def test_worker_storage_error_pauses_safely_and_can_resume(queue_factory, monkeypatch, caplog):
     clock, calls = [1000.0], []
-    secret = "sk-test-public-placeholder-only"
+    secret = "sk-test-only-placeholder-000000000000"
 
     async def execute(task_id, *args):
         calls.append(task_id)

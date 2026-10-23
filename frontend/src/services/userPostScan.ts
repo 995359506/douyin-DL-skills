@@ -108,7 +108,7 @@ export interface UserPostScanService {
   listWorks(scanId: string, filter: WorkFilter, cursor?: string | null, limit?: number): Promise<WorkPage>
   cancelScan(scanId: string): Promise<UserPostScan>
   createDownload(request: DownloadScanRequest): Promise<{ task_id: string; message: string }>
-  createDistill(request: { scanId: string; selection: ScanSelection; forceReanalyze?: boolean; downloadPath?: string; stagePolicy?: 'preview' | 'full' }): Promise<{ run_id: string; run: DistillRun; video_count: number; image_text_count: number; estimated_model_calls: number }>
+  createDistill(request: { scanId: string; selection: ScanSelection; forceReanalyze?: boolean; downloadPath?: string; stagePolicy?: 'preview' | 'full'; requestLimit?: number | null }): Promise<{ run_id: string; run: DistillRun; video_count: number; image_text_count: number; estimated_model_calls: number | null; minimum_model_calls: number; estimate_note: string }>
   getDistill(runId: string, includeText?: boolean): Promise<DistillDetail>
   listDistill(limit?: number, offset?: number): Promise<{ items: DistillRun[]; limit: number; offset: number }>
   cancelDistill(runId: string): Promise<DistillRun>
@@ -182,6 +182,7 @@ const httpUserPostScanService: UserPostScanService = {
       force_reanalyze: Boolean(request.forceReanalyze),
       stage_policy: request.stagePolicy || 'full',
       save_path: request.downloadPath || undefined,
+      request_limit: request.requestLimit ?? null,
     }, authConfig(request.scanId))
     return unwrap(response as unknown as ApiResponse)
   },

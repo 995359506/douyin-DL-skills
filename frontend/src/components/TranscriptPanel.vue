@@ -27,12 +27,14 @@
     </template>
 
     <div v-else-if="job?.status === 'completed'" class="transcript-result">
-      <el-alert type="success" title="口播文案已生成" description="内容来自本地视频音轨，已完成基础断句和口语整理。" show-icon :closable="false" />
+      <el-alert type="success" title="口播文案已生成" description="原始转写未经人工核实；整理稿经过 AI 断句和编辑，不能直接视为视频原话。" show-icon :closable="false" />
       <el-tabs v-model="activeTab" class="transcript-tabs">
         <el-tab-pane label="整理文案" name="polished"><pre>{{ job.polished_text || '暂无整理文案' }}</pre></el-tab-pane>
         <el-tab-pane label="原始转写" name="original"><pre>{{ job.original_transcript || '暂无原始转写' }}</pre></el-tab-pane>
       </el-tabs>
       <div class="transcript-actions">
+        <el-button type="primary" @click="readContent">阅读、收藏与视频核对</el-button>
+        <el-button @mousedown.prevent @click="collectSelection">收藏选中文字</el-button>
         <el-button @click="copyText"><el-icon><CopyDocument /></el-icon>复制当前内容</el-button>
         <el-button @click="exportFile('txt')"><el-icon><Download /></el-icon>导出 TXT</el-button>
         <el-button @click="exportFile('md')"><el-icon><Document /></el-icon>导出 Markdown</el-button>
@@ -51,6 +53,7 @@
       <el-alert type="warning" title="口播提取已取消" description="未生成新的文案结果。" show-icon :closable="false" />
       <el-button type="primary" :loading="loading" @click="restart">重新提取</el-button>
     </div>
+    <div v-else-if="job?.status === 'paused'" class="transcript-error"><el-alert type="warning" title="口播提取已暂停" :description="job.error?.reason || '已达到本批次模型请求上限，已完成的转写会保留。'" show-icon :closable="false" /><p>{{ job.error?.action || '请在批次结果中调整调用上限后继续。' }}</p><el-button @click="showBatchResults">查看批次结果</el-button></div>
 
     <div v-else class="transcript-state"><p>尚未开始提取。</p><el-button type="primary" :loading="loading" @click="start()">开始提取</el-button></div>
   </el-dialog>
@@ -61,11 +64,12 @@ import { computed, ref, watch, onBeforeUnmount } from 'vue'
 import { ElMessage } from 'element-plus'
 import { CopyDocument, Document, Download, Loading, RefreshRight } from '@element-plus/icons-vue'
 import { douyinApi } from '@/api'
+import { openContentReader, collectContent } from '@/api/content'
 
 interface TranscriptJob {
   job_id: string
   task_id: string
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused'
   stage: string
   progress: number
   original_transcript: string
@@ -151,6 +155,13 @@ const copyText = async () => {
 const exportFile = (format: 'txt' | 'md' | 'json') => {
   if (job.value?.job_id) window.open(`/api/transcripts/${encodeURIComponent(job.value.job_id)}/export?format=${format}`, '_blank', 'noopener')
 }
+const readContent = () => { open.value = false; openContentReader({ task_id: props.taskId }) }
+const collectSelection = () => {
+  const text = window.getSelection()?.toString().trim()
+  if (!text) { ElMessage.info('请先选择口播中的文字；手机可打开“阅读、收藏与视频核对”逐段摘录'); return }
+  collectContent({ task_id: props.taskId, source_type: activeTab.value, text })
+}
+const showBatchResults = () => { open.value = false; document.getElementById('batch-results')?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
 
 watch(() => props.modelValue, value => { if (value) { job.value = null; started.value = false; void loadExisting() } else stopPolling() })
 onBeforeUnmount(stopPolling)

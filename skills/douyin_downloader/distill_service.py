@@ -22,11 +22,13 @@ try:
     from .logger import get_logger
     from .transcription_service import ModelRequestError, _keychain_secret
     from .video_summary_service import SummaryModelError, SummaryPreparationError
+    from .usage_ledger import ModelControlError, UsageLedger, content_hash, current_request_context, get_default_ledger, model_request_context, recorded_post
 except ImportError:
     from db import TaskDB
     from logger import get_logger
     from transcription_service import ModelRequestError, _keychain_secret
     from video_summary_service import SummaryModelError, SummaryPreparationError
+    from usage_ledger import ModelControlError, UsageLedger, content_hash, current_request_context, get_default_ledger, model_request_context, recorded_post
 
 
 DownloadCallback = Callable[[Dict[str, Any]], Awaitable[Path]]
@@ -366,13 +368,14 @@ class DistillMarkdown:
 class DistillSynthesis:
     """使用现有 OpenAI 兼容文本通道完成 map-reduce 归纳。"""
 
-    def __init__(self, model: str = "gpt-5.6-luna", base_url: str = "", api_key: str = "", timeout: float = 300.0):
+    def __init__(self, model: str = "gpt-5.6-luna", base_url: str = "", api_key: str = "", timeout: float = 300.0, ledger: Optional[UsageLedger] = None):
         self.model = model
         self.base_url = (base_url or os.getenv("DOUYIN_LLM_BASE_URL", "")).rstrip("/")
         self.api_key = api_key or os.getenv("DOUYIN_LLM_API_KEY", "") or _keychain_secret("douyin-downloader-llm")
         self.timeout = timeout
         self.max_chars = max(10_000, int(os.getenv("DOUYIN_DISTILL_MAP_MAX_CHARS", "60000")))
         self.response_meta: List[Dict[str, Any]] = []
+        self.ledger = ledger
 
     def validate(self) -> None:
         if not self.base_url or not self.api_key:
@@ -381,12 +384,14 @@ class DistillSynthesis:
     async def _chat(self, prompt: str) -> str:
         self.validate()
         async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout, connect=20.0)) as client:
-            response = await client.post(
-                f"{self.base_url}/chat/completions",
+            context = current_request_context()
+            response = await recorded_post(
+                client, f"{self.base_url}/chat/completions", ledger=self.ledger,
+                execution_id=context.execution_id, stage=context.stage or "synthesis", provider="text", model=self.model,
                 headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                 json={"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": 0},
             )
-        if response.status_code >= 400:
+        if not 200 <= response.status_code < 300:
             raise DistillError(f"DISTILL_SYNTHESIS_HTTP_{response.status_code}", f"博主归纳模型请求失败（HTTP {response.status_code}）", "稍后重试归纳", response.status_code in {408, 429, 500, 502, 503, 504})
         body = response.json()
         choices = body.get("choices") or []
@@ -502,14 +507,30 @@ class DistillSynthesis:
         if current:
             groups.append(current)
         mapped = []
-        for group in groups:
+        ledger = self.ledger or get_default_ledger()
+        execution_id = current_request_context().execution_id
+        for group_index, group in enumerate(groups):
             prompt = """你是内容研究员。只根据给定视频资料归纳，禁止补充外部知识。严格返回 JSON。结构示例：{"themes":[],"methods":[],"contradictions":[],"expressions":[{"quote":"原文连续短句","note":"可复用原因","sources":["003"]}],"techniques":{"hooks":[{"pattern":"把原片中的【具体困境】化成【具体提问】","note":"原片使用具体困境引出提问","sources":["003"]}],"endings":[],"pacing":[]},"one_sentence":{"text":"一句话画像","sources":["003"]}}。techniques 只能从 narrative_structure.hook、ending、reusable_elements、editing_and_expression 归纳；反例：用提问开场（无原片具体元素，不要输出）。sources 必须使用输入中的三位 source 编号；quote 必须是所引作品中连续出现的原句，不得改写标点或添加省略号；one_sentence 不超过 120 字，必须由资料支撑。资料：\n""" + _json(group)
-            mapped.append(self._parse(await self._chat(prompt)))
+            fingerprint = content_hash({"prompt": prompt, "model": self.model, "endpoint": self.base_url, "version": 1})
+            result = await ledger.get_checkpoint(execution_id, f"synthesis_map:{group_index}", fingerprint) if ledger and execution_id else None
+            if result is None:
+                with model_request_context(stage="synthesis_map"):
+                    result = self._parse(await self._chat(prompt))
+                if ledger and execution_id:
+                    await ledger.save_checkpoint(execution_id, f"synthesis_map:{group_index}", fingerprint, result)
+            mapped.append(result)
         if not mapped:
             return {"one_sentence": "暂无足够的有效分析结果。", "themes": [], "methods": [], "contradictions": [], "expressions": [], "techniques": {}}
         if len(mapped) == 1:
             return self._validate(mapped[0], items)
-        reduced = self._parse(await self._chat("请合并以下分组归纳，按 pattern 去重并累计 sources，不得添加输入之外的事实。严格返回 JSON。techniques 必须是 {hooks:[{pattern:带【】占位的原片具体骨架,note:原因,sources:[三位来源编号]}],endings:[],pacing:[]}；只能依据输入的叙事结构、可复用要素与剪辑表达，不能输出‘用提问开场’等空泛套路。expressions 元素必须是 {quote:原文连续短句,note:复用原因,sources:[三位来源编号]}，quote 不得改写标点或加省略号；one_sentence 必须是 {text:120字内一句话,sources:[三位来源编号]}。\n" + _json(mapped)))
+        reduce_prompt = "请合并以下分组归纳，按 pattern 去重并累计 sources，不得添加输入之外的事实。严格返回 JSON。techniques 必须是 {hooks:[{pattern:带【】占位的原片具体骨架,note:原因,sources:[三位来源编号]}],endings:[],pacing:[]}；只能依据输入的叙事结构、可复用要素与剪辑表达，不能输出‘用提问开场’等空泛套路。expressions 元素必须是 {quote:原文连续短句,note:复用原因,sources:[三位来源编号]}，quote 不得改写标点或加省略号；one_sentence 必须是 {text:120字内一句话,sources:[三位来源编号]}。\n" + _json(mapped)
+        fingerprint = content_hash({"prompt": reduce_prompt, "model": self.model, "endpoint": self.base_url, "version": 1})
+        reduced = await ledger.get_checkpoint(execution_id, "synthesis_reduce", fingerprint) if ledger and execution_id else None
+        if reduced is None:
+            with model_request_context(stage="synthesis_reduce"):
+                reduced = self._parse(await self._chat(reduce_prompt))
+            if ledger and execution_id:
+                await ledger.save_checkpoint(execution_id, "synthesis_reduce", fingerprint, reduced)
         return self._validate(reduced, items)
 
 
@@ -556,8 +577,11 @@ class DistillService:
     async def _stage(self, run_id: str, item: Optional[Dict[str, Any]], stage: str, callback: Callable[[], Awaitable[Any]], retry_callback: Optional[Callable[[int], Awaitable[None]]] = None) -> Any:
         for attempt in range(len(self.retry_delays) + 1):
             try:
-                return await callback()
+                with model_request_context(retry_index=attempt):
+                    return await callback()
             except asyncio.CancelledError:
+                raise
+            except ModelControlError:
                 raise
             except Exception as exc:
                 if not _retryable(exc) or attempt >= len(self.retry_delays):
@@ -621,6 +645,8 @@ class DistillService:
                     result = await self._stage(run_id, item, "transcribing", lambda: self.transcribe_item(f"{run_id}:{aweme_id}", path, lambda stage, progress: self._progress(run_id, item, "transcript", progress)))
                 await self.db.update_distill_item(run_id, aweme_id, transcript_status="completed", original_transcript=result.get("original_transcript", ""), polished_text=result.get("polished_text", ""))
                 item.update(result)
+            except ModelControlError:
+                raise
             except Exception as exc:
                 error = _error_from_exception("transcribing", exc)
                 await self.db.update_distill_item(run_id, aweme_id, transcript_status="failed", error_json=_json(error), degrade_reason=error["reason"])
@@ -640,6 +666,8 @@ class DistillService:
                     result = await self._stage(run_id, item, "summarizing", lambda: self.summarize_item(f"{run_id}:{aweme_id}", path, lambda stage, progress: self._progress(run_id, item, "summary", progress)))
                 await self.db.update_distill_item(run_id, aweme_id, summary_status="completed", summary_json=_json(result))
                 item["summary"] = result
+            except ModelControlError:
+                raise
             except Exception as exc:
                 error = _error_from_exception("summarizing", exc)
                 await self.db.update_distill_item(run_id, aweme_id, summary_status="failed", error_json=_json(error), degrade_reason=error["reason"])
@@ -702,6 +730,10 @@ class DistillService:
         return root
 
     async def run(self, run_id: str) -> None:
+        with model_request_context(batch_kind="distill", batch_id=run_id, execution_id=run_id):
+            await self._run_scoped(run_id)
+
+    async def _run_scoped(self, run_id: str) -> None:
         self.cancel_events[run_id] = asyncio.Event()
         self.download_403_streak[run_id] = 0
         self.download_state_locks[run_id] = asyncio.Lock()
@@ -715,6 +747,7 @@ class DistillService:
             output_root = self._run_output_root(run)
             for item in items:
                 item["_save_root"] = str(output_root)
+            control_errors: list[ModelControlError] = []
 
             async def process_and_count(item: Dict[str, Any]) -> None:
                 deep_selected = (run.get("options") or {}).get("deep_selected_aweme_ids")
@@ -723,9 +756,15 @@ class DistillService:
                 if item.get("item_status") in ITEM_TERMINAL and item.get("item_status") != "failed":
                     return
                 try:
-                    await self._process_item(run_id, item)
+                    if control_errors:
+                        return
+                    with model_request_context(execution_id=f"{run_id}:{item['aweme_id']}"):
+                        await self._process_item(run_id, item)
                 except asyncio.CancelledError:
                     raise
+                except ModelControlError as exc:
+                    control_errors.append(exc)
+                    await self.db.update_distill_item(run_id, item["aweme_id"], item_status="queued", transcript_status="pending" if not item.get("original_transcript") else "completed", summary_status="pending" if not item.get("summary") else "completed", error_json=_json(_error("paused", exc.code, str(exc), "调整调用上限或恢复台账后继续")))
                 except Exception as exc:
                     if isinstance(exc, DistillError) and exc.code == "DISTILL_CIRCUIT_OPEN":
                         await self.db.update_distill_item(run_id, item["aweme_id"], item_status="queued", download_status="pending")
@@ -736,6 +775,9 @@ class DistillService:
                 await self._update_counts(run_id)
             await asyncio.gather(*(process_and_count(item) for item in items))
             await self._update_counts(run_id)
+            if control_errors:
+                await self.db.update_distill_run(run_id, status="paused", error_json=_json(_error("paused", control_errors[0].code, str(control_errors[0]), "调整调用上限或恢复台账后继续；已完成阶段会复用")))
+                return
             if self.download_circuit_errors.get(run_id):
                 await self.db.update_distill_run(run_id, status="paused", error_json=_json(self.download_circuit_errors[run_id]))
                 return
@@ -748,7 +790,8 @@ class DistillService:
                 await self.db.update_distill_run(run_id, status="failed", error_json=_json(_error("synthesis", "DISTILL_NO_USABLE_ITEMS", "没有任何作品完成口播或画面分析", "修复失败条目后重试")), completed_at=_now())
                 return
             await self.db.update_distill_run(run_id, status="synthesizing")
-            synthesis = await self._stage(run_id, None, "synthesis", lambda: self.synthesis.run(usable))
+            with model_request_context(execution_id=f"{run_id}:synthesis", stage="synthesis"):
+                synthesis = await self._stage(run_id, None, "synthesis", lambda: self.synthesis.run(usable))
             audit = synthesis.pop("_audit", {})
             if audit:
                 expressions = audit.get("expressions") or {}
@@ -768,6 +811,8 @@ class DistillService:
             await self._close_inflight_items(run_id, cancelled=True)
             await self.db.update_distill_run(run_id, status="cancelled", completed_at=_now())
             raise
+        except ModelControlError as exc:
+            await self.db.update_distill_run(run_id, status="paused", error_json=_json(_error("paused", exc.code, str(exc), "调整调用上限或恢复台账后继续；已完成阶段会复用")))
         except Exception as exc:
             error = _error_from_exception("run", exc)
             current = await self.db.get_distill_run(run_id)
@@ -808,6 +853,12 @@ class DistillService:
         for item in items:
             if item.get("item_status") not in ({"failed", "cancelled", "summary_invalid"} if not selected else {"failed", "cancelled", "summary_invalid", "transcribed", "degraded", "ready", "written"}):
                 continue
+            if item.get("item_status") == "summary_invalid":
+                ledger = get_default_ledger() or getattr(self.synthesis, "ledger", None)
+                if ledger:
+                    # 用户明确要求重做无效分析，不能被同一执行的成功响应检查点挡住。
+                    # 原始转写已在条目中持久化，下面仍会复用，不重新请求ASR。
+                    await ledger.delete_checkpoints(f"{run_id}:{item['aweme_id']}")
             await self.db.update_distill_item(
                 run_id,
                 item["aweme_id"],

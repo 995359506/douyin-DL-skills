@@ -86,7 +86,10 @@
       />
 
       <DownloadBatchQueue />
+      <BatchResultsPanel />
+      <ContentWorkspace />
       <DownloadRecords />
+      <ContentReaderHost />
     </main>
 
     <footer class="site-footer"><span>F2 / D·L WORKBENCH</span><a href="https://f2.wiki" target="_blank" rel="noreferrer">查看文档 <el-icon aria-hidden="true"><TopRight /></el-icon></a></footer>
@@ -99,8 +102,11 @@ import { storeToRefs } from 'pinia'
 import { useDownloadStore } from '@/stores/download'
 import DownloadRecords from '@/components/DownloadRecords.vue'
 import DownloadBatchQueue from '@/components/DownloadBatchQueue.vue'
+import BatchResultsPanel from '@/components/BatchResultsPanel.vue'
 import DouyinShareInput from '@/components/DouyinShareInput.vue'
 import UserPostScanner from '@/components/UserPostScanner.vue'
+import ContentWorkspace from '@/components/ContentWorkspace.vue'
+import ContentReaderHost from '@/components/ContentReaderHost.vue'
 import { classifyUniversalInput, classifyUniversalUrl, hasConfirmedMultiVideoMix } from '@/utils/universalRouting'
 
 const store = useDownloadStore()

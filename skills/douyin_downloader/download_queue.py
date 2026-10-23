@@ -12,8 +12,10 @@ import aiosqlite
 
 try:
     from .logger import get_logger
+    from .usage_ledger import model_request_context, get_default_ledger
 except ImportError:
     from logger import get_logger
+    from usage_ledger import model_request_context, get_default_ledger
 
 
 logger = get_logger()
@@ -132,12 +134,15 @@ class PersistentDownloadQueue:
         profile_id: str = "",
         client_request_id: str = "",
         auto_summary: bool = True,
+        request_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """仅写本地数据库；相同请求编号始终返回同一批次。"""
         if not video_ids or len(video_ids) > 20000:
             raise ValueError("请选择 1 至 20000 条视频")
         if any(not isinstance(value, str) or not re.fullmatch(r"[0-9]{5,32}", value) for value in video_ids):
             raise ValueError("视频编号格式不正确")
+        if request_limit is not None and (isinstance(request_limit, bool) or not isinstance(request_limit, int) or request_limit < 0):
+            raise ValueError("调用次数上限必须是非负整数")
         if len(author) > 80 or len(profile_id) > 256 or len(client_request_id) > 128:
             raise ValueError("作者或请求编号过长")
         unique_ids = list(dict.fromkeys(video_ids))
@@ -174,6 +179,13 @@ class PersistentDownloadQueue:
             except BaseException:
                 await self._db.rollback()
                 raise
+            if ledger := get_default_ledger():
+                try:
+                    await ledger.set_limit("download", batch_id, request_limit)
+                except Exception:
+                    await self._db.execute("UPDATE download_queue_batches SET status='paused' WHERE batch_id=?", (batch_id,))
+                    await self._db.commit()
+                    raise
             result = await self._view(batch_id)
             self._reset_reuse_scan()
         self._wake.set()
@@ -255,11 +267,13 @@ class PersistentDownloadQueue:
                 if not task_id:
                     task_id = await self._prepare_task(batch_id, aweme_id, item["author"], item["profile_id"])
                 # 此时任务编号已经落盘，execute 才可以开始请求抖音。
-                result = await self.execute_item(task_id, aweme_id, bool(item["auto_summary"]))
+                with model_request_context(batch_kind="download", batch_id=batch_id):
+                    result = await self.execute_item(task_id, aweme_id, bool(item["auto_summary"]))
                 if isinstance(result, dict) and result.get("status") == "missing":
                     # 任务记录可能被用户删除；此状态保证尚未发出网络请求，只重建一次。
                     task_id = await self._prepare_task(batch_id, aweme_id, item["author"], item["profile_id"])
-                    result = await self.execute_item(task_id, aweme_id, bool(item["auto_summary"]))
+                    with model_request_context(batch_kind="download", batch_id=batch_id):
+                        result = await self.execute_item(task_id, aweme_id, bool(item["auto_summary"]))
                 succeeded = isinstance(result, dict) and result.get("status") == "completed"
                 await self._finish_item(
                     batch_id, aweme_id, succeeded,
@@ -313,9 +327,10 @@ class PersistentDownloadQueue:
             async with self._lock:
                 if not await self._queued_item_is_active(batch_id, aweme_id):
                     continue
-            task_id = await self.reuse_item(
-                aweme_id, item["author"], item["profile_id"], bool(item["auto_summary"])
-            )
+            with model_request_context(batch_kind="download", batch_id=batch_id):
+                task_id = await self.reuse_item(
+                    aweme_id, item["author"], item["profile_id"], bool(item["auto_summary"])
+                )
             if task_id is None:
                 continue
             if not isinstance(task_id, str) or not task_id:

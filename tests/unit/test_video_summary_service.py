@@ -87,6 +87,123 @@ def test_gateway_precedes_existing_channels():
     ]
 
 
+def test_heju_config_loads_environment_or_own_keychain_item(monkeypatch):
+    import skills.douyin_downloader.video_summary_service as module
+
+    monkeypatch.delenv("DOUYIN_VIDEO_SUMMARY_HEJU_API_KEY", raising=False)
+    monkeypatch.delenv("DOUYIN_VIDEO_SUMMARY_HEJU_BASE_URL", raising=False)
+    monkeypatch.delenv("DOUYIN_VIDEO_SUMMARY_HEJU_MODEL", raising=False)
+    reads = []
+
+    def secret(service):
+        reads.append(service)
+        return "heju-test-secret" if service == "douyin-downloader-summary-heju" else ""
+
+    monkeypatch.setattr(module, "_keychain_secret", secret)
+    config = SummaryConfig.from_environment()
+    assert config.heju_api_key == "heju-test-secret"
+    assert config.heju_base_url == "https://www.hejuapi.com/v1beta"
+    assert config.heju_model == "gemini-3.8-flash"
+    assert "douyin-downloader-summary-heju" in reads
+    reads.clear()
+    monkeypatch.setenv("DOUYIN_VIDEO_SUMMARY_HEJU_API_KEY", " env-heju-test ")
+    monkeypatch.setenv("DOUYIN_VIDEO_SUMMARY_HEJU_BASE_URL", " https://www.hejuapi.com/v1beta/ ")
+    assert SummaryConfig.from_environment().heju_api_key == "env-heju-test"
+    assert SummaryConfig.from_environment().heju_base_url == config.heju_base_url
+    assert "douyin-downloader-summary-heju" not in reads
+
+
+def test_heju_is_last_and_requires_a_key():
+    config = dict(gateway_api_key="gateway-test", api_key="primary-test", fallback_api_key="fallback-test")
+    service = VideoSummaryService(SummaryConfig(**config, heju_api_key="heju-test"))
+    service.validate_config()
+    assert [p["name"] for p in service._providers()] == ["gateway", "primary", "fallback", "heju"]
+    assert service._providers()[-1]["model"] == "gemini-3.8-flash"
+    assert [p["name"] for p in VideoSummaryService(SummaryConfig(**config))._providers()] == [
+        "gateway", "primary", "fallback",
+    ]
+    with pytest.raises(RuntimeError, match="HTTPS"):
+        VideoSummaryService(SummaryConfig(heju_api_key="test", heju_base_url="http://www.hejuapi.com/v1beta")).validate_config()
+    with pytest.raises(RuntimeError, match="白名单"):
+        VideoSummaryService(SummaryConfig(heju_api_key="test", heju_base_url="https://www.hejuapi.com.evil.test/v1beta")).validate_config()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("winning_index", [0, 1, 2, 3])
+async def test_heju_only_receives_video_after_all_earlier_channels_fail(tmp_path, monkeypatch, winning_index):
+    import base64
+    import httpx
+    import skills.douyin_downloader.video_summary_service as module
+
+    service = VideoSummaryService(SummaryConfig(
+        gateway_api_key="gateway-test", api_key="primary-test", fallback_api_key="fallback-test",
+        heju_api_key="heju-test", request_retries=0,
+    ))
+    service.validate_config()
+    video = tmp_path / "synthetic.mp4"
+    video.write_bytes(b"synthetic-video-only")
+    providers = service._providers()
+    calls = []
+
+    def handle(request):
+        provider = providers[len(calls)]
+        calls.append(provider["name"])
+        assert str(request.url) == f"{provider['base_url']}/models/{provider['model']}:generateContent"
+        assert request.headers["x-goog-api-key"] == provider["api_key"]
+        body = json.loads(request.content)
+        inline = body["contents"][0]["parts"][0]["inlineData"]
+        assert inline["mimeType"] == "video/mp4"
+        assert base64.b64decode(inline["data"]) == video.read_bytes()
+        if len(calls) - 1 < winning_index:
+            return httpx.Response(503, json={"error": {"message": "测试通道不可用"}})
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": '{"title":"备用链路测试"}'}]}}]})
+
+    client_class = httpx.AsyncClient
+    monkeypatch.setattr(module.httpx, "AsyncClient", lambda **kwargs: client_class(
+        transport=httpx.MockTransport(handle), **kwargs,
+    ))
+    result = await service._generate_parsed("priority-test", video, "测试")
+    assert result["title"] == "备用链路测试"
+    assert calls == [p["name"] for p in providers[:winning_index + 1]]
+    assert service._job_provider_indexes["priority-test"] == winning_index
+    attempts = service._job_attempts["priority-test"]
+    assert [a["status"] for a in attempts] == [503] * winning_index + [200]
+    assert all(p["api_key"] not in json.dumps(attempts) for p in providers)
+
+
+@pytest.mark.asyncio
+async def test_heju_failure_is_identified_as_enabled_fallback(monkeypatch):
+    service = VideoSummaryService(SummaryConfig(api_key="primary-test", heju_api_key="heju-test"))
+
+    async def fail(_job, provider, _payload, _timeout):
+        raise SummaryModelError(401, "测试权限不足", provider["model"], provider=provider["name"],
+                                host="www.hejuapi.com" if provider["name"] == "heju" else "api.text168.com")
+
+    monkeypatch.setattr(service, "_request_provider", fail)
+    with pytest.raises(SummaryModelError) as failure:
+        await service._request_generate("heju-failure", None, "测试")
+    error = serialize_summary_error(failure.value)
+    assert "备用接口已尝试且失败" in error["action"]
+    assert "备用接口未启用" not in error["action"]
+    assert "heju" in error["reason"] and "HTTP 401" in error["reason"]
+
+
+@pytest.mark.asyncio
+async def test_heju_diagnostics_redacts_key(monkeypatch):
+    from skills.douyin_downloader import web
+    from skills.douyin_downloader.transcription_service import KEYCHAIN_STATUS
+
+    service = VideoSummaryService(SummaryConfig(heju_api_key="heju-private-test-secret"))
+    monkeypatch.setattr(web, "video_summary_service", service)
+    monkeypatch.setitem(KEYCHAIN_STATUS, "douyin-downloader-summary-heju", {"status": "ok"})
+    for result in (await web.config_status(), await web.ai_diagnostics()):
+        heju = result.data["summary"]["heju"]
+        assert heju["api_key_configured"] is True
+        assert heju["base_url"] == "https://www.hejuapi.com/v1beta"
+        assert heju["keychain"]["status"] == "ok"
+        assert "heju-private-test-secret" not in json.dumps(result.data)
+
+
 @pytest.mark.asyncio
 async def test_gateway_failover_reaches_25_fallback(monkeypatch):
     service = VideoSummaryService(SummaryConfig(

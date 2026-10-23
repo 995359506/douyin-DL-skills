@@ -141,7 +141,7 @@ async def test_execute_login_failure_is_safe_and_pauses_with_scan_guidance(monke
     task = SimpleNamespace(id="task", status="pending")
     monkeypatch.setattr(web, "task_manager", SimpleNamespace(get_task=AsyncMock(return_value=task)))
     monkeypatch.setattr(web, "_resolve_task_video_path", AsyncMock(side_effect=HTTPException(404)))
-    secret = "sk-test-public-placeholder-only"
+    secret = "sk-test-only-placeholder-000000000000"
 
     def reject(_):
         raise HTTPException(401, detail=secret)

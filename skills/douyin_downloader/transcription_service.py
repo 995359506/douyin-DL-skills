@@ -20,6 +20,11 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
+try:
+    from .usage_ledger import ModelControlError, UsageLedger, content_hash, file_content_hash, get_default_ledger, recorded_post
+except ImportError:
+    from usage_ledger import ModelControlError, UsageLedger, content_hash, file_content_hash, get_default_ledger, recorded_post
+
 
 ProgressCallback = Callable[[str, int], Awaitable[None]]
 KEYCHAIN_STATUS: Dict[str, Dict[str, Any]] = {}
@@ -110,8 +115,9 @@ class TranscriptionService:
     MAX_AUDIO_BYTES = 20 * 1024 * 1024
     RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 
-    def __init__(self, config: Optional[LLMConfig] = None):
+    def __init__(self, config: Optional[LLMConfig] = None, ledger: Optional[UsageLedger] = None):
         self.config = config or LLMConfig.from_environment()
+        self.ledger = ledger
         self._cancel_events: Dict[str, asyncio.Event] = {}
 
     def validate_config(self) -> None:
@@ -175,14 +181,20 @@ class TranscriptionService:
             self._check_cancelled(job_id)
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
-                    response = await client.post(url, headers=headers, json=payload)
+                    response = await recorded_post(
+                        client, url, ledger=self.ledger, execution_id=job_id,
+                        stage="transcription" if url == self.config.dashscope_base_url else "polishing",
+                        provider="dashscope" if url == self.config.dashscope_base_url else "text",
+                        model=str(payload.get("model") or ""), retry_index=attempt,
+                        headers=headers, json=payload,
+                    )
             except httpx.TransportError:
                 if attempt >= self.config.request_retries:
                     raise
                 await self._wait_retry(job_id, float(2 ** attempt))
                 continue
 
-            if response.status_code >= 400:
+            if not 200 <= response.status_code < 300:
                 try:
                     body = response.json()
                     detail = body.get("message") or body.get("error", {}).get("message") or body.get("code")
@@ -294,25 +306,41 @@ class TranscriptionService:
         self._check_cancelled(job_id)
         return _content_text(response)
 
-    async def run(self, job_id: str, video_path: Path, callback: Optional[ProgressCallback] = None) -> Dict[str, Any]:
+    async def run(self, job_id: str, video_path: Path, callback: Optional[ProgressCallback] = None, partial_callback: Optional[Callable[[str], Awaitable[None]]] = None) -> Dict[str, Any]:
         self._cancel_events[job_id] = asyncio.Event()
         try:
             self._check_cancelled(job_id)
-            await self._update(callback, "extracting_audio", 15)
-            with tempfile.TemporaryDirectory(prefix="douyin-transcript-") as temp_dir:
-                audio_path = Path(temp_dir) / "audio.wav"
-                await self.extract_audio(video_path, audio_path)
-                if audio_path.stat().st_size > self.MAX_AUDIO_BYTES:
-                    raise RuntimeError("提取后的音频超过 20 MB，暂不支持该视频长度；请先裁剪视频后重试")
-                self._check_cancelled(job_id)
-                await self._update(callback, "transcribing", 45)
-                transcript = await self.transcribe_audio(audio_path, job_id)
-                if not transcript.strip():
-                    raise RuntimeError("模型未返回有效转写内容")
-                await self._update(callback, "polishing", 75)
+            ledger = self.ledger or get_default_ledger()
+            fingerprint = content_hash({"video": await file_content_hash(video_path), "model": self.config.transcribe_model, "endpoint": self.config.dashscope_base_url, "version": 1}) if ledger else ""
+            checkpoint = await ledger.get_checkpoint(job_id, "transcription", fingerprint) if ledger else None
+            transcript = checkpoint.get("original_transcript", "") if isinstance(checkpoint, dict) else ""
+            if not transcript:
+                await self._update(callback, "extracting_audio", 15)
+                with tempfile.TemporaryDirectory(prefix="douyin-transcript-") as temp_dir:
+                    audio_path = Path(temp_dir) / "audio.wav"
+                    await self.extract_audio(video_path, audio_path)
+                    if audio_path.stat().st_size > self.MAX_AUDIO_BYTES:
+                        raise RuntimeError("提取后的音频超过 20 MB，暂不支持该视频长度；请先裁剪视频后重试")
+                    self._check_cancelled(job_id)
+                    await self._update(callback, "transcribing", 45)
+                    transcript = await self.transcribe_audio(audio_path, job_id)
+                    if not transcript.strip():
+                        raise RuntimeError("模型未返回有效转写内容")
+                    if ledger:
+                        await ledger.save_checkpoint(job_id, "transcription", fingerprint, {"original_transcript": transcript})
+            # 先持久化原始转写，再启动整理；限额或上游故障时仍可阅读未整理文本。
+            if partial_callback:
+                await partial_callback(transcript)
+            await self._update(callback, "polishing", 75)
+            polish_hash = content_hash({"transcript": transcript, "model": self.config.polish_model, "endpoint": self.config.base_url, "version": 1})
+            polished_result = await ledger.get_checkpoint(job_id, "polishing", polish_hash) if ledger else None
+            polished = polished_result.get("polished_text", "") if isinstance(polished_result, dict) else ""
+            if not polished:
                 polished = await self.polish_transcript(transcript, job_id)
-                await self._update(callback, "completed", 100)
-                return {"original_transcript": transcript, "polished_text": polished, "segments": []}
+                if ledger:
+                    await ledger.save_checkpoint(job_id, "polishing", polish_hash, {"polished_text": polished})
+            await self._update(callback, "completed", 100)
+            return {"original_transcript": transcript, "polished_text": polished, "segments": []}
         finally:
             self._cancel_events.pop(job_id, None)
 
@@ -349,6 +377,8 @@ def new_job_id() -> str:
 
 
 def serialize_error(exc: BaseException) -> Dict[str, str]:
+    if isinstance(exc, ModelControlError):
+        return _error("paused", exc.code, str(exc), "调整批次调用上限或恢复台账后，点击继续；已完成阶段会复用")
     if isinstance(exc, asyncio.CancelledError):
         return _error("cancelled", "TRANSCRIPT_CANCELLED", "文案提取已取消", "可重新点击提取口播")
     if isinstance(exc, ModelRequestError):

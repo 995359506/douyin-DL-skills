@@ -2,6 +2,17 @@
 
 抖音视频下载器 Skill 模块，提供完整的下载功能和 CLI 接口。
 
+## 手机链接收件
+
+手机可通过 HTTP + IP 的 `/douyin-inbox/` 页面或私人快捷指令提交单条视频链接。
+服务器独立运行 `mobile_inbox.py`，只绑定回环端口，保存链接与固定状态；
+`DOUYIN_INBOX_SUBMIT_TOKEN` 和 `DOUYIN_INBOX_WORKER_TOKEN` 为两个不同的随机口令，均至少 20 字符。
+电脑独立运行 `mobile_inbox_worker.py`，环境变量为 `DOUYIN_INBOX_URL`、`DOUYIN_INBOX_WORKER_TOKEN`、
+`DOUYIN_INBOX_MAIN_DB` 和可选的 `DOUYIN_INBOX_STATE_DIR`。服务器及电脑都要保留回执数据库。
+取件每 10 秒一次，复用现有持久化下载队列，下载间隔 30 秒，总结独立执行；重复提交和重启不重复入队。
+电脑休眠时不下载、不总结，链接留在服务器，恢复联网后自动接收。
+部署、权限及快捷指令生成步骤见根目录 README 的“iPhone：分享链接到电脑看板”。
+
 ## 本地口播文案提取
 
 Web 工作台支持对已完成的单视频任务提取口播文案，也支持在作者画廊中逐条批量提取；已有成功结果与正在运行的作业会跳过。流程为本机 `ffmpeg` 抽取音频、音频模型转写、`gpt-5.6-luna` 整理文案，结果保存在任务数据库中并可导出 TXT/JSON。模型配置使用 `DOUYIN_LLM_BASE_URL`、`DOUYIN_LLM_API_KEY`、`DOUYIN_LLM_TRANSCRIBE_MODEL` 和 `DOUYIN_LLM_POLISH_MODEL`；瞬时网络、限流、上游错误和无效响应每个模型请求最多自动重试 3 次，鉴权或请求格式错误不会重复提交。可通过 `DOUYIN_LLM_REQUEST_RETRIES` 调整额外重试次数，默认为 3；不要把 API Key 写入代码或前端。
